@@ -35,6 +35,7 @@ class OptimizationConfig:
     skip_frames_depth: int = 2
     device: str = "auto"
     
+    # 自动选择设备，优先使用 CUDA，如果不可用则回退到 CPU
     def __post_init__(self):
         if self.device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,11 +52,24 @@ class GuidanceConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """日志配置"""
+    log_dir: str = "logs"
+    log_level: str = "INFO"
+    log_to_file: bool = True
+    log_to_console: bool = True
+    # FPS 统计配置
+    enable_fps_stats: bool = True
+    fps_window_size: int = 30  # FPS 平滑窗口
+
+
+@dataclass
 class SystemConfig:
     """系统配置"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     
     target_queries: List[str] = field(default_factory=lambda: ["a cup", "a bottle"])
     camera_width: int = 640

@@ -32,27 +32,42 @@ class HandTracker:
         self.max_num_hands = max_num_hands
         self.min_confidence = min_confidence
         
-        model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
-        if not os.path.exists(model_path):
-            logger.info("下载手部追踪模型...")
-            url = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
-            urllib.request.urlretrieve(url, model_path)
-            logger.info(f"模型已保存: {model_path}")
-        
-        from mediapipe.tasks import python
-        from mediapipe.tasks.python import vision
-        
-        base_options = python.BaseOptions(model_asset_path=model_path)
-        options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            num_hands=max_num_hands,
-            min_hand_detection_confidence=min_confidence,
-            min_hand_presence_confidence=min_confidence,
-            min_tracking_confidence=min_confidence
-        )
-        self.detector = vision.HandLandmarker.create_from_options(options)
-        
-        logger.info("手部追踪器初始化完成")
+        try:
+            model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+            if not os.path.exists(model_path):
+                logger.info("下载手部追踪模型...")
+                url = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+                try:
+                    urllib.request.urlretrieve(url, model_path)
+                    logger.info(f"模型已保存: {model_path}")
+                except Exception as e:
+                    logger.error(f"下载模型失败: {e}", exc_info=True)
+                    raise RuntimeError(f"无法下载 MediaPipe 手部追踪模型: {e}")
+            else:
+                logger.info(f"使用现有模型: {model_path}")
+            
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.HandLandmarkerOptions(
+                base_options=base_options,
+                num_hands=max_num_hands,
+                min_hand_detection_confidence=min_confidence,
+                min_hand_presence_confidence=min_confidence,
+                min_tracking_confidence=min_confidence
+            )
+            self.detector = vision.HandLandmarker.create_from_options(options)
+            
+            logger.info("手部追踪器初始化完成")
+            
+        except Exception as e:
+            logger.error(f"手部追踪器初始化失败: {e}", exc_info=True)
+            logger.error("请检查:")
+            logger.error("  1. MediaPipe 是否正确安装")
+            logger.error("  2. 模型文件是否存在或网络是否可用")
+            logger.error("  3. 磁盘空间是否充足")
+            raise RuntimeError(f"无法初始化手部追踪器: {e}")
     
     def detect(self, image: np.ndarray) -> Dict:
         from mediapipe import Image as MPImage

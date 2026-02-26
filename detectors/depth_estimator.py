@@ -32,36 +32,43 @@ class DepthEstimator:
         logger.info(f"加载 MiDaS 模型: {model_name}")
         logger.info(f"设备: {self.device}, FP16: {self.use_fp16}, 缩放: {scale}")
         
-        # download / load model and transforms with network error handling so
-        # that the app can still start when offline or if GitHub is unreachable.
+        # 加载模型，带网络错误处理
         try:
+            logger.info("下载/加载 MiDaS 模型...")
             self.model = torch.hub.load("intel-isl/MiDaS", model_name)
             if self.use_fp16:
                 self.model = self.model.half()
             self.model = self.model.to(self.device).eval()
+            logger.info("MiDaS 模型加载成功")
         except Exception as e:
-            logger.error(f"无法加载 MiDaS 模型: {e}")
+            logger.error(f"无法加载 MiDaS 模型: {e}", exc_info=True)
+            logger.error("请检查:")
+            logger.error("  1. 网络连接是否正常")
+            logger.error("  2. GitHub 是否可访问")
+            logger.error("  3. PyTorch Hub 缓存是否有效")
             self.model = None
         
         try:
+            logger.info("下载/加载 MiDaS transforms...")
             self.transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
             if "small" in model_name.lower():
                 self.transform = self.transforms.small_transform
             else:
                 self.transform = self.transforms.dpt_transform
+            logger.info("MiDaS transforms 加载成功")
         except Exception as e:
-            logger.error(f"无法加载 MiDaS transforms: {e}")
+            logger.error(f"无法加载 MiDaS transforms: {e}", exc_info=True)
             self.transform = None
         
         if self.model is not None and self.transform is not None:
             logger.info("MiDaS 初始化完成")
         else:
             logger.warning("MiDaS 未能完全初始化，深度估计将被禁用")
+            logger.warning("系统将继续运行，但不会进行深度估计")
     
     def estimate(self, image: np.ndarray) -> np.ndarray:
-        # if model or transform failed to load, return a blank depth map
+        # 如果模型或 transform 加载失败，返回空白深度图
         if self.model is None or self.transform is None:
-            logger.error("深度估计模型未加载，无法执行估计")
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
         
         try:
@@ -102,7 +109,7 @@ class DepthEstimator:
             return depth
             
         except Exception as e:
-            logger.error(f"深度估计失败: {e}")
+            logger.error(f"深度估计失败: {e}", exc_info=True)
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
     
     def get_depth_at_point(self, depth_map: np.ndarray, 

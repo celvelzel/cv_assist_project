@@ -36,21 +36,39 @@ class OWLViTDetector:
         logger.info(f"加载 OWL-ViT 模型: {model_name}")
         logger.info(f"设备: {self.device}, FP16: {self.use_fp16}")
         
-        dtype = torch.float16 if self.use_fp16 else torch.float32
-        self.processor = OwlViTProcessor.from_pretrained(model_name)
-        self.model = OwlViTForObjectDetection.from_pretrained(
-            model_name, torch_dtype=dtype
-        ).to(self.device)
-        self.model.eval()
-        
-        self._warmup()
-        logger.info("OWL-ViT 初始化完成")
+        try:
+            dtype = torch.float16 if self.use_fp16 else torch.float32
+            logger.info("下载/加载 OWL-ViT 处理器...")
+            self.processor = OwlViTProcessor.from_pretrained(model_name)
+            
+            logger.info("下载/加载 OWL-ViT 模型...")
+            self.model = OwlViTForObjectDetection.from_pretrained(
+                model_name, torch_dtype=dtype
+            ).to(self.device)
+            self.model.eval()
+            
+            logger.info("预热模型...")
+            self._warmup()
+            logger.info("OWL-ViT 初始化完成")
+            
+        except Exception as e:
+            logger.error(f"OWL-ViT 模型加载失败: {e}", exc_info=True)
+            logger.error("请检查:")
+            logger.error("  1. 网络连接是否正常")
+            logger.error("  2. HuggingFace 是否可访问")
+            logger.error("  3. 磁盘空间是否充足")
+            logger.error("  4. PyTorch 和 transformers 是否正确安装")
+            raise RuntimeError(f"无法加载 OWL-ViT 模型: {e}")
     
     def _warmup(self):
-        dummy = Image.fromarray(np.zeros((self.input_size[1], self.input_size[0], 3), dtype=np.uint8))
-        inputs = self.processor(text=["test"], images=dummy, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            _ = self.model(**inputs)
+        """预热模型以避免首次推理延迟"""
+        try:
+            dummy = Image.fromarray(np.zeros((self.input_size[1], self.input_size[0], 3), dtype=np.uint8))
+            inputs = self.processor(text=["test"], images=dummy, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                _ = self.model(**inputs)
+        except Exception as e:
+            logger.warning(f"模型预热失败: {e}")
     
     def detect(self, image: np.ndarray, queries: List[str], 
                threshold: Optional[float] = None) -> List[Dict]:
