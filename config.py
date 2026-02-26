@@ -31,7 +31,9 @@ class ModelConfig:
 class OptimizationConfig:
     """优化配置"""
     use_fp16: bool = True
+    # 跳帧设置，减少检测的频率以提升性能
     skip_frames_detection: int = 2
+    # 跳帧设置，减少深度估计的频率以提升性能
     skip_frames_depth: int = 2
     device: str = "auto"
     
