@@ -22,6 +22,9 @@ from detectors.depth_estimator import DepthEstimator
 from core.guidance import GuidanceController, GuidanceResult
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
+# 降低第三方库的日志级别，避免过多无关信息干扰输出
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -183,6 +186,9 @@ class CVAssistSystem:
         cap = cv2.VideoCapture(camera_id)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
+
+        window_name = "CV Assist System"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         
         if not cap.isOpened():
             logger.error("无法打开摄像头")
@@ -193,7 +199,13 @@ class CVAssistSystem:
         
         try:
             while True:
-                ret, frame = cap.read()
+                try:
+                    ret, frame = cap.read()
+                except cv2.error as e:
+                    # 有时在窗口关闭时cv2会抛出错误，安全退出
+                    logger.info("摄像头读取时发生错误，可能是窗口已关闭。退出循环。")
+                    break
+                
                 if not ret:
                     break
                 
@@ -216,14 +228,23 @@ class CVAssistSystem:
                     depth_vis = cv2.resize(depth_vis, (160, 120))
                     output[0:120, -160:] = depth_vis
                 
-                cv2.imshow("CV Assist System", output)
+                try:
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
+
+                cv2.imshow(window_name, output)
                 
+                # 如果窗口被关闭，cv2.getWindowProperty返回值会小于1
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
                 elif key == ord('d'):
                     show_depth = not show_depth
-        
+        except Exception as e:
+            # 捕获其它异常，避免程序崩溃
+            logger.exception("运行过程中发生异常，程序即将退出。")
         finally:
             cap.release()
             cv2.destroyAllWindows()
@@ -242,6 +263,8 @@ def main():
     
     system = CVAssistSystem(config)
     system.run(args.camera)
+    # 程序正常结束时确保返回码为0
+    sys.exit(0)
 
 
 if __name__ == "__main__":

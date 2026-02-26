@@ -9,6 +9,8 @@ import numpy as np
 from typing import Tuple
 from dataclasses import dataclass
 import logging
+import os
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,35 @@ class GuidanceController:
             'forward': '前', 'backward': '后'
         }
         return mapping.get(direction, direction)
+
+    def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
+        candidates = [
+            os.environ.get("CV_ASSIST_FONT"),
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for path in candidates:
+            if path and os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
+
+    def _draw_text(self, image: np.ndarray, text: str, origin: Tuple[int, int],
+                   color: Tuple[int, int, int], size: int = 22) -> np.ndarray:
+        if all(ord(ch) < 128 for ch in text):
+            cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            return image
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(pil_image)
+        font = self._get_font(size)
+        draw.text(origin, text, font=font, fill=(color[2], color[1], color[0]))
+        return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     
     def draw(self, image: np.ndarray, hand_center: Tuple[int, int],
              target_center: Tuple[int, int], result: GuidanceResult) -> np.ndarray:
@@ -109,11 +140,17 @@ class GuidanceController:
         color = (0, 255, 0) if result.ready_to_grab else (0, 255, 255)
         cv2.line(output, hand_center, target_center, color, 2)
         
-        (tw, th), _ = cv2.getTextSize(result.instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        cv2.rectangle(output, (10, 10), (20 + tw, 20 + th + 5), (0, 0, 0), -1)
-        
-        cv2.putText(output, result.instruction, (15, 15 + th),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        if all(ord(ch) < 128 for ch in result.instruction):
+            (tw, th), _ = cv2.getTextSize(result.instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            cv2.rectangle(output, (10, 10), (20 + tw, 20 + th + 8), (0, 0, 0), -1)
+            cv2.putText(output, result.instruction, (15, 15 + th),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        else:
+            font = self._get_font(24)
+            bbox = font.getbbox(result.instruction)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            cv2.rectangle(output, (10, 10), (20 + tw, 20 + th + 8), (0, 0, 0), -1)
+            output = self._draw_text(output, result.instruction, (15, 15), color, size=24)
         
         info = f"dx:{result.dx} dy:{result.dy} d:{result.depth_diff:.2f}"
         cv2.putText(output, info, (15, output.shape[0] - 15),
