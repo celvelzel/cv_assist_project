@@ -6,6 +6,7 @@ Pillow>=10.0.0
 transformers>=4.35.0
 mediapipe>=0.10.0
 timm>=0.9.0
+norfair>=2.0.0
 
 # 配置管理
 python-dotenv>=1.0.0

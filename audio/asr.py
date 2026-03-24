@@ -9,6 +9,9 @@ import numpy as np
 from typing import Optional
 import warnings
 
+from core.interfaces import ParsedIntent
+from audio.intent_parser import create_intent_parser
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -37,7 +40,8 @@ class ASREngine:
     def __init__(self, 
                  model_name: str = "base",
                  device: str = "cuda",
-                 language: str = "zh"):
+                 language: str = "zh",
+                 intent_parser_type: str = "regex"):
         """
         初始化 ASR 引擎
         
@@ -45,6 +49,7 @@ class ASREngine:
             model_name: Whisper 模型名称 (tiny/base/small/medium/large)
             device: 运行设备 ('cuda' 或 'cpu')
             language: 语言代码 ('zh' 中文, 'en' 英文等)
+            intent_parser_type: 意图解析器类型 ("regex" 或未来 "llm")
         """
         if not WHISPER_AVAILABLE:
             raise RuntimeError("Whisper 未安装。请运行: pip install openai-whisper")
@@ -57,6 +62,10 @@ class ASREngine:
             logger.warning("CUDA 不可用，切换到 CPU")
             device = "cpu"
         self.device = device
+        
+        # 初始化意图解析器
+        self.intent_parser = create_intent_parser(intent_parser_type)
+        logger.info(f"意图解析器初始化成功: {intent_parser_type}")
         
         logger.info(f"正在加载 Whisper 模型: {model_name} (设备: {device})")
         

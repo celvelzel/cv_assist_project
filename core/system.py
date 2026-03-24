@@ -23,6 +23,9 @@ from detectors.hand_tracker import HandTracker
 from detectors.depth_estimator import DepthEstimator
 from detectors.obstacle_detector import ObstacleDetector, ObstacleDetectionResult
 from core.guidance import GuidanceController, GuidanceResult
+from core.interfaces import TrackedDetection
+from core.spatial_resolver import create_spatial_resolver, ISpatialResolver
+from core.tracker import create_object_tracker
 from utils.logger import setup_logging, FPSCounter
 
 logger = logging.getLogger(__name__)
@@ -204,11 +207,27 @@ class CVAssistSystem:
             enabled=cfg.obstacle.enable_obstacle_detection,
         )
         
+        # 初始化目标追踪器（用于多目标选择）
+        tracker_type = getattr(cfg, 'tracker_type', 'simple')
+        self.object_tracker = create_object_tracker(tracker_type)
+        logger.info(f"目标追踪器初始化成功: {tracker_type}")
+        
+        # 初始化空间解析器（处理视角反转）
+        camera_facing = getattr(cfg, 'camera_facing', 'outward')
+        self.spatial_resolver = create_spatial_resolver(camera_facing)
+        logger.info(f"空间解析器初始化成功: camera_facing={camera_facing}")
+        
         logger.info("所有组件初始化成功")
     
     def _init_audio_components(self):
         """初始化音频组件 (ASR 和 TTS)"""
         cfg = self.config.audio
+        
+        # 初始化意图解析器（用于解析语音指令）
+        from audio.intent_parser import create_intent_parser
+        intent_parser_type = getattr(cfg, 'intent_parser_type', 'regex')
+        self.intent_parser = create_intent_parser(intent_parser_type)
+        logger.info(f"意图解析器初始化成功: {intent_parser_type}")
         
         # 初始化 ASR
         if cfg.enable_asr:
@@ -254,6 +273,9 @@ class CVAssistSystem:
         self._last_instruction_state = None
         self._last_instruction_ts = 0.0
         self._last_grab_ts = 0.0
+        
+        # 空间提示（来自语音指令，如 "left cup" -> "left"）
+        self._current_spatial_hint = None
 
     def _reset_tts_context(self):
         """目标切换后清理播报上下文，避免旧指令残留。"""
@@ -261,6 +283,7 @@ class CVAssistSystem:
         self._last_instruction_state = None
         self._last_instruction_ts = 0.0
         self._last_grab_ts = 0.0
+        self._current_spatial_hint = None  # 重置空间提示
         if self.tts_engine:
             self.tts_engine.clear_queue()
 
@@ -334,12 +357,21 @@ class CVAssistSystem:
             status = result.get('status')
             if status == 'ok' and result.get('target'):
                 target = result['target']
+                spatial_hint = result.get('spatial_hint')  # 新增：空间提示
+                
                 self.config.target_queries = [target]
                 self.cached_detections = []
+                self._current_spatial_hint = spatial_hint  # 存储空间提示
                 self._reset_tts_context()
-                logger.info(f"检测目标已更新为: {target}")
-                if self.tts_engine:
-                    self.tts_engine.speak(f"正在寻找{target}")
+                
+                if spatial_hint:
+                    logger.info(f"检测目标已更新为: {target} (空间: {spatial_hint})")
+                    if self.tts_engine:
+                        self.tts_engine.speak(f"正在寻找{spatial_hint}边的{target}")
+                else:
+                    logger.info(f"检测目标已更新为: {target}")
+                    if self.tts_engine:
+                        self.tts_engine.speak(f"正在寻找{target}")
             else:
                 message = result.get('message')
                 if message:
@@ -399,23 +431,46 @@ class CVAssistSystem:
         # 计算引导指令（只有当同时检测到手和目标时）
         guidance_result = None
         if hands and detections:
-            hand = hands[0]      # 取第一只手
-            target = detections[0]  # 取第一个目标
+            # 使用追踪器为检测结果分配稳定的 tracking_id
+            tracked_detections = self.object_tracker.update(detections)
             
-            # 获取手部和目标的深度值
-            hand_depth = 0.5    # 默认中等深度
-            target_depth = 0.5
+            # 如果有空间提示（来自语音指令），使用空间解析器选择目标
+            if hasattr(self, '_current_spatial_hint') and self._current_spatial_hint:
+                # 过滤出匹配目标类别的追踪结果
+                target_label = self.config.target_queries[0] if self.config.target_queries else None
+                if target_label:
+                    matching_tracks = [t for t in tracked_detections if t.label == target_label]
+                    # 使用空间解析器选择目标
+                    selected_target = self.spatial_resolver.resolve(self._current_spatial_hint, matching_tracks)
+                else:
+                    selected_target = tracked_detections[0] if tracked_detections else None
+            else:
+                # 无空间提示，选择第一个追踪结果
+                selected_target = tracked_detections[0] if tracked_detections else None
             
-            if depth_map is not None:
-                hand_depth = self.depth_estimator.get_depth_at_point(depth_map, hand['center'])
-                target_depth = self.depth_estimator.get_depth_at_point(depth_map, target['center'])
-            
-            # 计算引导指令
-            guidance_result = self.guidance.calculate(
-                hand['center'], target['center'],
-                hand_depth, target_depth,
-                hand.get('gesture', 'unknown')
-            )
+            if selected_target:
+                hand = hands[0]      # 取第一只手
+                
+                # 获取手部和目标的深度值
+                hand_depth = 0.5    # 默认中等深度
+                target_depth = 0.5
+                
+                if depth_map is not None:
+                    hand_depth = self.depth_estimator.get_depth_at_point(depth_map, hand['center'])
+                    target_depth = self.depth_estimator.get_depth_at_point(depth_map, selected_target.center)
+                
+                # 计算引导指令（传入 tracking_id）
+                guidance_result = self.guidance.calculate(
+                    hand['center'], selected_target.center,
+                    hand_depth, target_depth,
+                    hand.get('gesture', 'unknown'),
+                    tracking_id=selected_target.tracking_id
+                )
+                
+                # 更新 FrameResult 中的 detections 为选中的目标（保持向后兼容）
+                detections = [vars(selected_target)]
+            else:
+                guidance_result = None
         
         # 障碍物检测（只要检测到手部且深度图可用）
         obstacle_result = None
@@ -550,15 +605,28 @@ class CVAssistSystem:
             
             logger.info(f"识别结果: '{text}'")
             
-            # 解析指令，提取目标物体
-            target = self.asr_engine.parse_command(text)
-            
-            if target:
-                logger.info(f"语音解析目标成功: {target}")
-                return {'status': 'ok', 'target': target}
+            # 使用意图解析器解析指令（支持空间修饰符）
+            if hasattr(self, 'intent_parser') and self.intent_parser:
+                parsed = self.intent_parser.parse(text)
+                if parsed:
+                    logger.info(f"意图解析成功: 目标='{parsed.target_class}', 空间='{parsed.spatial_modifier}'")
+                    return {
+                        'status': 'ok',
+                        'target': parsed.target_class,
+                        'spatial_hint': parsed.spatial_modifier
+                    }
+                else:
+                    logger.warning(f"意图解析失败: '{text}'")
+                    return {'status': 'error', 'message': '抱歉，无法理解您的指令'}
             else:
-                logger.warning(f"无法解析指令: '{text}'")
-                return {'status': 'error', 'message': '抱歉，无法理解您的指令'}
+                # 向后兼容：如果没有意图解析器，使用旧的解析方法
+                target = self.asr_engine.parse_command(text)
+                if target:
+                    logger.info(f"语音解析目标成功: {target}")
+                    return {'status': 'ok', 'target': target}
+                else:
+                    logger.warning(f"无法解析指令: '{text}'")
+                    return {'status': 'error', 'message': '抱歉，无法理解您的指令'}
             
         except Exception as e:
             logger.error(f"语音输入处理失败: {e}", exc_info=True)

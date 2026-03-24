@@ -24,6 +24,7 @@ class GuidanceResult:
     - direction_h/v/d: 水平/垂直/深度方向指示
     - dx/dy/depth_diff: 具体的偏移值
     - ready_to_grab: 是否已就位，可以执行抓取
+    - tracking_id: 目标追踪ID（用于多目标选择）
     """
     instruction: str       # 显示给用户的指令文本
     direction_h: str       # 水平方向: 'left', 'right', 'center'
@@ -35,6 +36,7 @@ class GuidanceResult:
     ready_to_grab: bool    # 是否就位可抓取
     stable_ready_frames: int  # 当前已连续稳定对齐的帧数
     state: str             # 语义状态: 'moving' | 'ready' | 'grabbed'
+    tracking_id: Optional[int] = None  # 目标追踪ID（用于多目标选择）
 
 
 class GuidanceController:
@@ -113,7 +115,8 @@ class GuidanceController:
                   target_center: Tuple[int, int],
                   hand_depth: float,
                   target_depth: float,
-                  gesture: str = 'unknown') -> GuidanceResult:
+                  gesture: str = 'unknown',
+                  tracking_id: Optional[int] = None) -> GuidanceResult:
         """
         计算引导指令
         
@@ -123,6 +126,7 @@ class GuidanceController:
             hand_depth: 手部深度值 (0-1)
             target_depth: 目标深度值 (0-1)
             gesture: 当前手势
+            tracking_id: 目标追踪ID（用于多目标选择）
             
         返回:
             GuidanceResult 对象，包含引导指令和方向信息
@@ -198,7 +202,8 @@ class GuidanceController:
             depth_diff=dd,
             ready_to_grab=ready,
             stable_ready_frames=self._ready_streak,
-            state=state
+            state=state,
+            tracking_id=tracking_id
         )
     
     def _translate(self, direction: str) -> str:
