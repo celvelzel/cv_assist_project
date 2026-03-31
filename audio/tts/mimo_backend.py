@@ -20,12 +20,14 @@ try:
     import pygame
     PYGAME_AVAILABLE = True
 except ImportError:
+    pygame = None
     PYGAME_AVAILABLE = False
 
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
+    OpenAI = None
     OPENAI_AVAILABLE = False
 
 
@@ -37,6 +39,20 @@ MIMO_VOICES = {
 }
 
 MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
+
+TTS_CACHE_MAP = {
+    '向左移动': 'move_left',
+    '向右移动': 'move_right',
+    '向上移动': 'move_up',
+    '向下移动': 'move_down',
+    '向前移动': 'move_forward',
+    '向后移动': 'move_backward',
+    '保持位置': 'hold_position',
+    '准备抓取!': 'ready_to_grab',
+    '抓取! 闭合手掌': 'grab_close_hand',
+    '已抓住!': 'grabbed'
+}
+LOCAL_AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_audio")
 
 
 class MiMoTTS(BaseTTS):
@@ -103,10 +119,12 @@ class MiMoTTS(BaseTTS):
         self._stop_token = object()
 
         # 初始化 pygame mixer
+        assert pygame is not None
         if not pygame.mixer.get_init():
             pygame.mixer.init()
 
         # 初始化 OpenAI 客户端
+        assert OpenAI is not None
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -133,7 +151,15 @@ class MiMoTTS(BaseTTS):
         返回:
             WAV 音频字节数据
         """
-        logger.debug(f"MiMo TTS 合成: '{text}'")
+        if text in TTS_CACHE_MAP:
+            filename = TTS_CACHE_MAP[text]
+            cache_path = os.path.join(LOCAL_AUDIO_DIR, f"{filename}.wav")
+            if os.path.exists(cache_path):
+                logger.debug(f"MiMo TTS 命中本地缓存: '{text}' -> {cache_path}")
+                with open(cache_path, 'rb') as f:
+                    return f.read()
+
+        logger.debug(f"MiMo TTS API合成: '{text}'")
 
         completion = self.client.chat.completions.create(
             model="mimo-v2-tts",
@@ -154,7 +180,11 @@ class MiMoTTS(BaseTTS):
         )
 
         message = completion.choices[0].message
-        audio_data = base64.b64decode(message.audio.data)
+        audio = getattr(message, "audio", None)
+        if audio is None or not getattr(audio, "data", None):
+            raise RuntimeError("MiMo TTS 返回结果缺少音频数据")
+
+        audio_data = base64.b64decode(audio.data)
         return audio_data
 
     def _play_audio(self, audio_bytes: bytes):
@@ -171,6 +201,7 @@ class MiMoTTS(BaseTTS):
                 f.write(audio_bytes)
 
             # pygame 播放
+            assert pygame is not None
             pygame.mixer.music.load(tmp_path)
             pygame.mixer.music.set_volume(self.volume)
             pygame.mixer.music.play()
@@ -200,9 +231,11 @@ class MiMoTTS(BaseTTS):
 
                 text, done_event = payload
                 try:
-                    logger.debug(f"MiMo TTS 异步播放: '{text}'")
-                    audio_bytes = self._synthesize(text)
-                    self._play_audio(audio_bytes)
+                    parts = [p.strip() for p in text.split('|') if p.strip()]
+                    for part in parts:
+                        logger.debug(f"MiMo TTS 异步播放: '{part}'")
+                        audio_bytes = self._synthesize(part)
+                        self._play_audio(audio_bytes)
                 except Exception as e:
                     logger.error(f"MiMo TTS 合成/播放失败: {e}", exc_info=True)
                 finally:
@@ -229,8 +262,10 @@ class MiMoTTS(BaseTTS):
                 self._enqueue_async(text, wait=True)
             else:
                 # 同步模式
-                audio_bytes = self._synthesize(text)
-                self._play_audio(audio_bytes)
+                parts = [p.strip() for p in text.split('|') if p.strip()]
+                for part in parts:
+                    audio_bytes = self._synthesize(part)
+                    self._play_audio(audio_bytes)
 
         except Exception as e:
             logger.error(f"MiMo TTS 播放失败: {e}", exc_info=True)
@@ -269,7 +304,7 @@ class MiMoTTS(BaseTTS):
     def stop(self):
         """停止当前播放"""
         try:
-            if PYGAME_AVAILABLE and pygame.mixer.get_init():
+            if PYGAME_AVAILABLE and pygame is not None and pygame.mixer.get_init():
                 pygame.mixer.music.stop()
             logger.debug("MiMo TTS 停止播放")
         except Exception as e:
@@ -322,7 +357,7 @@ class MiMoTTS(BaseTTS):
                 if hasattr(self, 'worker_thread'):
                     self.worker_thread.join(timeout=3.0)
 
-            if PYGAME_AVAILABLE and pygame.mixer.get_init():
+            if PYGAME_AVAILABLE and pygame is not None and pygame.mixer.get_init():
                 pygame.mixer.music.stop()
                 pygame.mixer.quit()
 
