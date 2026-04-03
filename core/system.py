@@ -69,6 +69,8 @@ class FrameResult:
     gesture: str                     # 当前手势
     target_visible: bool             # 当前任务目标是否可见
     target_x: float                  # 目标中心 X 坐标（像素），无目标时为 float('nan')
+    hand_near_target: bool           # 手部中心是否接近目标中心
+    hand_target_distance_px: float   # 手部中心与目标中心的像素距离
     detections_count: int            # 检测目标数量
     hands_count: int                 # 手部数量
 
@@ -336,6 +338,7 @@ class CVAssistSystem:
             catch_x_min_displacement_px=self.config.logging.catch_x_min_displacement_px,
             catch_x_stable_frames=self.config.logging.catch_x_stable_frames,
             catch_x_stable_max_std_px=self.config.logging.catch_x_stable_max_std_px,
+            catch_hand_near_target_px=self.config.logging.catch_hand_near_target_px,
         )
 
         if self.config.logging.enable_task_metrics:
@@ -822,10 +825,19 @@ class CVAssistSystem:
         guidance_state = "idle"
         ready_to_grab = False
         stable_ready_frames = 0
+        hand_near_target = False
+        hand_target_distance_px = float('nan')
         gesture = hands[0].get('gesture', 'unknown') if hands else 'unknown'
         if hands and detections:
             hand = hands[0]      # 取第一只手
             target = detections[0]  # 取第一个目标
+            hand_target_distance_px = float(np.hypot(
+                target['center'][0] - hand['center'][0],
+                target['center'][1] - hand['center'][1],
+            ))
+            hand_near_target = (
+                hand_target_distance_px <= self.config.logging.catch_hand_near_target_px
+            )
             
             # 获取手部和目标的深度值
             hand_depth = 0.5    # 默认中等深度
@@ -879,6 +891,8 @@ class CVAssistSystem:
             gesture=gesture,
             target_visible=has_target,
             target_x=target_x,
+            hand_near_target=hand_near_target,
+            hand_target_distance_px=hand_target_distance_px,
             detections_count=len(detections),
             hands_count=len(hands),
         )
@@ -1085,6 +1099,8 @@ class CVAssistSystem:
             gesture=result.gesture,
             target_visible=result.target_visible,
             target_x=result.target_x,
+            hand_near_target=result.hand_near_target,
+            hand_target_distance_px=result.hand_target_distance_px,
             proc_fps_current=proc_stats.get('current', 0.0),
             proc_fps_avg=proc_stats.get('average', 0.0),
             e2e_fps_current=e2e_stats.get('current', 0.0),

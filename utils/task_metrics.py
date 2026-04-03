@@ -50,6 +50,8 @@ class FrameMetrics:
     gesture: str
     target_visible: bool
     target_x: float          # 目标中心 X 坐标（像素），无目标时为 float('nan')
+    hand_near_target: bool   # 当前帧手部是否已靠近目标
+    hand_target_distance_px: float  # 手中心与目标中心距离（像素）
     proc_fps_current: float
     proc_fps_avg: float
     e2e_fps_current: float
@@ -78,6 +80,7 @@ class TaskMetricsCollector:
         catch_x_min_displacement_px: int = 25,
         catch_x_stable_frames: int = 5,
         catch_x_stable_max_std_px: float = 12.0,
+        catch_hand_near_target_px: int = 140,
     ):
         self.grasp_stable_frames = max(1, int(grasp_stable_frames))
         self.ready_confirm_window_sec = max(0.5, float(ready_confirm_window_sec))
@@ -85,6 +88,7 @@ class TaskMetricsCollector:
         self.catch_x_min_displacement_px = max(1, int(catch_x_min_displacement_px))
         self.catch_x_stable_frames = max(1, int(catch_x_stable_frames))
         self.catch_x_stable_max_std_px = max(0.0, float(catch_x_stable_max_std_px))
+        self.catch_hand_near_target_px = max(1, int(catch_hand_near_target_px))
         self.reset()
 
     def reset(self):
@@ -126,7 +130,8 @@ class TaskMetricsCollector:
         self.first_ready_ts = None
         self.first_grabbed_ts = None
         # X 轴位移抓取判定追踪
-        self._target_x_at_task_start: float = float('nan')
+        self._target_x_at_hand_near: float = float('nan')
+        self.first_hand_near_target_ts = None
         self._target_x_at_ready_enter: float = float('nan')
         self._target_x_window: deque = deque(maxlen=max(self.catch_x_stable_frames * 2, 10))
         self._catch_trigger: str = ""
@@ -183,14 +188,20 @@ class TaskMetricsCollector:
 
         if frame_metrics.target_visible and self.first_target_detected_ts is None:
             self.first_target_detected_ts = frame_metrics.frame_end_ts
-            if not math.isnan(frame_metrics.target_x):
-                self._target_x_at_task_start = frame_metrics.target_x
         if frame_metrics.has_guidance and self.first_guidance_ts is None:
             self.first_guidance_ts = frame_metrics.frame_end_ts
         if frame_metrics.ready_to_grab and self.first_ready_ts is None:
             self.first_ready_ts = frame_metrics.frame_end_ts
         if frame_metrics.guidance_state == "grabbed" and self.first_grabbed_ts is None:
             self.first_grabbed_ts = frame_metrics.frame_end_ts
+        if (
+            frame_metrics.hand_near_target
+            and self.first_hand_near_target_ts is None
+            and not math.isnan(frame_metrics.target_x)
+        ):
+            self.first_hand_near_target_ts = frame_metrics.frame_end_ts
+            self._target_x_at_hand_near = frame_metrics.target_x
+            self._target_x_window.clear()
 
         self._update_completion_state(frame_metrics)
 
@@ -226,16 +237,20 @@ class TaskMetricsCollector:
 
         # 允许两种位移基准：
         # 1) ready 基准（优先）
-        # 2) 任务开始后首次目标位置基准（无手/未进入 ready 时的兜底）
+        # 2) 手已靠近目标时的首次目标位置基准
         base_x = self._target_x_at_ready_enter
         base_ts = self.ready_enter_ts
         trigger_name = "target_x_displacement_ready"
         if math.isnan(base_x):
-            base_x = self._target_x_at_task_start
-            base_ts = self.first_target_detected_ts
-            trigger_name = "target_x_displacement_task_start"
+            base_x = self._target_x_at_hand_near
+            base_ts = self.first_hand_near_target_ts
+            trigger_name = "target_x_displacement_hand_near"
 
         if math.isnan(base_x):
+            return
+
+        # 必须先有手靠近目标，才允许进入成功判定。
+        if self.first_hand_near_target_ts is None and self.first_ready_ts is None:
             return
 
         # 累積目標 X 座標樣本（ready 之后只要目標可見即可）
