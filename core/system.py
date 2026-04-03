@@ -68,7 +68,6 @@ class FrameResult:
     stable_ready_frames: int         # ready 持续帧数
     gesture: str                     # 当前手势
     target_visible: bool             # 当前任务目标是否可见
-    target_x: float                  # 目标中心 X 坐标（像素），无目标时为 float('nan')
     detections_count: int            # 检测目标数量
     hands_count: int                 # 手部数量
 
@@ -323,7 +322,6 @@ class CVAssistSystem:
         self._task_index = 0
         self._last_task_summary_ts = 0.0
         self._requested_shutdown = False
-        self._pause_target_detection = False
 
         # 任务开始确认挂起态：语音触发后等待目标稳定检测 task_start_confirm_window_sec 秒再激活
         self._pending_task: Optional[Dict] = None  # 保存待激活的任务参数
@@ -333,9 +331,6 @@ class CVAssistSystem:
             grasp_stable_frames=self.config.guidance.grasp_stable_frames,
             ready_confirm_window_sec=self.config.logging.task_ready_confirm_window_sec,
             lost_target_window_sec=self.config.logging.task_lost_target_window_sec,
-            catch_x_min_displacement_px=self.config.logging.catch_x_min_displacement_px,
-            catch_x_stable_frames=self.config.logging.catch_x_stable_frames,
-            catch_x_stable_max_std_px=self.config.logging.catch_x_stable_max_std_px,
         )
 
         if self.config.logging.enable_task_metrics:
@@ -495,29 +490,6 @@ class CVAssistSystem:
         logger.info("任务正式激活: task_id=%s target=%s", task_id, target)
         self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
 
-    def _start_task_now(self, target: str):
-        """立即激活任务（用于预设目标自动启动）。"""
-        target = (target or "").strip()
-        if not target:
-            return
-
-        task_id = self._next_task_id()
-        now = time.time()
-        self.current_task = {
-            "task_id": task_id,
-            "target_query": target,
-            "start_time": now,
-        }
-        self.task_state = "running"
-        self._last_task_summary_ts = 0.0
-        self.task_metrics_collector.start_task(
-            task_id=task_id,
-            target_query=target,
-            start_time=now,
-            session_id=self.session_id,
-        )
-        logger.info("预设目标任务已自动激活: task_id=%s target=%s", task_id, target)
-
     def _update_pending_task_confirmation(self, detections: List[Dict], now: float):
         """主循环每帧调用：根据当前检测结果推进任务开始确认进度。"""
         if not self._pending_task:
@@ -535,10 +507,10 @@ class CVAssistSystem:
                              self._pending_task["task_id"])
             self._pending_task_target_since_ts = None
 
-    def _enqueue_task_report(self, report_dict: Dict, task_id: str, created_at: float) -> Optional[str]:
-        """将冻结后的任务报告入队后台写盘。返回写入路径，若无 writer 则 None。"""
+    def _enqueue_task_report(self, report_dict: Dict, task_id: str, created_at: float):
+        """将冻结后的任务报告入队后台写盘。"""
         if not self.report_writer:
-            return None
+            return
         output_path = self.report_writer.build_output_path(task_id, created_at=created_at)
         envelope = TaskReportEnvelope(
             task_id=task_id,
@@ -547,7 +519,6 @@ class CVAssistSystem:
             created_at=created_at,
         )
         self.report_writer.enqueue(envelope)
-        return output_path
 
     def _finish_current_task(self, end_reason: str, error_message: str = "") -> Optional[Dict]:
         """结束当前任务并提交冻结快照。同时丢弃尚未激活的挂起任务。"""
@@ -565,19 +536,10 @@ class CVAssistSystem:
             end_time=now,
             error_message=error_message,
         )
-        report_path = ""
         if should_emit_report:
-            report_path = self._enqueue_task_report(report_dict, task_id=task_id, created_at=now) or ""
+            self._enqueue_task_report(report_dict, task_id=task_id, created_at=now)
         else:
             logger.info("任务未检测到目标，跳过报告写入: task_id=%s", task_id)
-
-        if end_reason == "success":
-            # 任务成功后暂停目标检测，直到下一次语音设置新目标
-            self._pause_target_detection = True
-            self.cached_detections = []
-            console_report = self.task_metrics_collector.build_success_console_report(report_path)
-            logger.info("\n%s", console_report)
-
         self.current_task = None
         self.task_state = "idle"
         return report_dict
@@ -738,7 +700,6 @@ class CVAssistSystem:
                 self._finish_current_task('switch_target')
 
             self.config.target_queries = [target]
-            self._pause_target_detection = False
             self.cached_detections = []
             self._reset_tts_context()
             self._begin_target_search_feedback(target)
@@ -782,16 +743,12 @@ class CVAssistSystem:
         # 执行目标检测（按配置的跳帧率）
         skip_det = self.config.optimization.skip_frames_detection
         # 只有当 skip_det=0 或当前帧数满足跳帧条件时才执行检测，否则使用缓存结果
-        if self._pause_target_detection:
-            self.cached_detections = []
-            detections = []
-        else:
-            if skip_det == 0 or self.frame_count % (skip_det + 1) == 0:
-                t0 = time.perf_counter()
-                self.cached_detections = self.detector.detect(frame, queries)
-                det_time = (time.perf_counter() - t0) * 1000  # 转换为毫秒
-                detection_executed = True
-            detections = self.cached_detections  # 使用缓存的检测结果
+        if skip_det == 0 or self.frame_count % (skip_det + 1) == 0:
+            t0 = time.perf_counter()
+            self.cached_detections = self.detector.detect(frame, queries)
+            det_time = (time.perf_counter() - t0) * 1000  # 转换为毫秒
+            detection_executed = True
+        detections = self.cached_detections  # 使用缓存的检测结果
         
         # 执行手部检测（每帧都执行，因为很快）
         t0 = time.perf_counter()
@@ -844,7 +801,6 @@ class CVAssistSystem:
         has_target = bool(detections)
         has_hand = bool(hands)
         has_guidance = guidance_result is not None
-        target_x = float(detections[0]['center'][0]) if detections else float('nan')
         
         # 返回处理结果
         return FrameResult(
@@ -869,7 +825,6 @@ class CVAssistSystem:
             stable_ready_frames=stable_ready_frames,
             gesture=gesture,
             target_visible=has_target,
-            target_x=target_x,
             detections_count=len(detections),
             hands_count=len(hands),
         )
@@ -1075,7 +1030,6 @@ class CVAssistSystem:
             stable_ready_frames=result.stable_ready_frames,
             gesture=result.gesture,
             target_visible=result.target_visible,
-            target_x=result.target_x,
             proc_fps_current=proc_stats.get('current', 0.0),
             proc_fps_avg=proc_stats.get('average', 0.0),
             e2e_fps_current=e2e_stats.get('current', 0.0),
@@ -1123,18 +1077,6 @@ class CVAssistSystem:
         
         logger.info(f"检测目标: {self.config.target_queries}")
         logger.info(f"摄像头选择: {camera_id}")
-
-        # 有预设目标时，启动即进入任务态（无需先按 v 语音触发）
-        if (
-            self.config.target_queries
-            and not self.current_task
-            and not self._pending_task
-        ):
-            preset_target = (self.config.target_queries[0] or "").strip()
-            if preset_target:
-                self._begin_target_search_feedback(preset_target)
-                self._pause_target_detection = False
-                self._start_task_now(preset_target)
         
         # 尝试打开摄像头，带异常处理
         try:
@@ -1354,7 +1296,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='CV 视觉辅助系统')
-    parser.add_argument('--config', choices=['fast', 'balanced', 'voice', 'tts', 'mimo-tts', 'light'], 
+    parser.add_argument('--config', choices=['fast', 'balanced', 'voice', 'tts', 'mimo-tts'], 
                        default='balanced',
                        help='配置模式: fast=快速, balanced=平衡, voice=启用ASR+TTS, tts=仅启用TTS, mimo-tts=MiMo云端TTS')
     parser.add_argument('--camera', type=int, default=None,

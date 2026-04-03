@@ -20,12 +20,4 @@ profiles:
       enable_asr: false
       enable_tts: false
 
-  light: # 极速模式：大幅降低检测频率，适合 CPU 运行
-    model:
-      owlvit_input_size: [256, 256]
-      midas_model: MiDaS_small
-    optimization:
-      skip_frames_detection: 5
-      skip_frames_depth: 5
-
 # balanced 无额外 override，直接使用 config.py 中的全部默认值。

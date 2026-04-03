@@ -92,14 +92,6 @@ class MiMoTTS(BaseTTS):
                 "  2. 设置环境变量 MIMO_API_KEY 或 XIAOMI_MIMO_API_KEY\n"
                 "  3. 在 config.py 的 AudioConfig 中设置 mimo_api_key"
             )
-        if self.api_key.strip().lower() in {"your_mimo_api_key_here", "your_mimo_api_key"}:
-            raise RuntimeError(
-                "MiMo TTS API Key 仍是占位值。请在 .env 中将 MIMO_API_KEY 设置为真实可用 key。"
-            )
-
-        # 认证失败后标记停用，避免每条指令都重复 401 报错
-        self._auth_failed = False
-        self._auth_failed_warned = False
 
         self.voice = voice
         self.volume = max(0.0, min(1.0, volume))
@@ -209,16 +201,9 @@ class MiMoTTS(BaseTTS):
                 text, done_event = payload
                 try:
                     logger.debug(f"MiMo TTS 异步播放: '{text}'")
-                    if self._auth_failed:
-                        continue
                     audio_bytes = self._synthesize(text)
                     self._play_audio(audio_bytes)
                 except Exception as e:
-                    msg = str(e)
-                    if "Invalid API Key" in msg or "AuthenticationError" in msg or "code: 401" in msg:
-                        self._auth_failed = True
-                        logger.error("MiMo TTS 鉴权失败（401 Invalid API Key），已暂停后续 MiMo 播报。请检查 MIMO_API_KEY。")
-                        self.clear_queue()
                     logger.error(f"MiMo TTS 合成/播放失败: {e}", exc_info=True)
                 finally:
                     if done_event is not None:
@@ -232,12 +217,6 @@ class MiMoTTS(BaseTTS):
         """播放文本"""
         if not text or not text.strip():
             logger.warning("空文本，跳过 MiMo TTS 播放")
-            return
-
-        if self._auth_failed:
-            if not self._auth_failed_warned:
-                logger.warning("MiMo TTS 已因鉴权失败停用（401）。请修正 MIMO_API_KEY 后重启程序。")
-                self._auth_failed_warned = True
             return
 
         text = text.strip()

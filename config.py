@@ -468,7 +468,7 @@ class LLMVisionConfig:
     # 效果: 超过此时长未收到响应则判定为超时。
     # 推荐: 5.0 秒适合大多数模型；网络较差时可增加到 10.0 秒。
 
-    max_frames_for_vision: int = 1
+    max_frames_for_vision: int = 4
     # 发送给 LLM 的最大画面帧数。
     # 效果: 帧数越多 LLM 获得的上下文信息越丰富，但请求体积和费用也越大。
     # 推荐: 4 帧已能提供足够的运动上下文信息。
@@ -553,21 +553,6 @@ class LoggingConfig:
     # 效果: 目标连续消失超过此秒数后，判定为目标丢失并终止任务。
     # 推荐: 4.0 秒，避免短暂遮挡导致误判终止。
 
-    catch_x_min_displacement_px: int = 100
-    # 抓取成功判定：目标横向（X 轴）最小位移像素数。
-    # 效果: 就绪状态进入后，目标 X 坐标相对初始位置的绝对偏移达到此值才触发抓取确认。
-    # 推荐: 25 像素，适配 640×480 摄像头分辨率；分辨率更高时可适当增大。
-
-    catch_x_stable_frames: int = 3
-    # 抓取成功判定：目标 X 轴需在稳定窗口内持续 N 帧。
-    # 效果: 防止短暂抖动触发误判，确保目标在新位置稳定落稳。
-    # 推荐: 3 帧（低 FPS 场景响应更快）。
-
-    catch_x_stable_max_std_px: float = 10
-    # 抓取成功判定：X 轴稳定窗口内允许的最大标准差（像素）。
-    # 效果: 值越小要求越稳定；值越大容忍更多抖动。
-    # 推荐: 10.0 像素，适配普通摄像头检测框抖动。
-
 
 @dataclass
 class SystemConfig:
@@ -601,9 +586,9 @@ class SystemConfig:
     llm_vision: LLMVisionConfig = field(default_factory=LLMVisionConfig)
     # LLM 视觉增强配置（Poe API、模型选择）
 
-    target_queries: List[str] = field(default_factory=lambda: ["a bottle"])
+    target_queries: List[str] = field(default_factory=list)
     # 默认检测目标列表（OWL-ViT 的文本查询条件）。
-    # 效果: 系统会检测画面中符合这些文本描述的物体。默认预置为 "a bottle"。
+    # 效果: 系统会检测画面中符合这些文本描述的物体。启动时为空，等待语音指令指定目标。
     # 格式: 使用英文名词短语，如 "a cup", "a bottle", "a person"。
     # 注意: 此值可在运行时被 core/system.py 动态修改。
 
@@ -763,8 +748,6 @@ def _apply_env(config: SystemConfig) -> None:
     当前支持的环境变量:
     - MIMO_API_KEY / XIAOMI_MIMO_API_KEY -> config.audio.mimo_api_key
     - POE_API_KEY -> config.llm_vision.poe_api_key
-    - TARGET_QUERY -> config.target_queries（单个目标）
-    - TARGET_QUERIES -> config.target_queries（逗号分隔多个目标）
 
     参数:
         config: 待覆盖的 SystemConfig 实例
@@ -776,15 +759,6 @@ def _apply_env(config: SystemConfig) -> None:
     poe_key = os.environ.get("POE_API_KEY")
     if poe_key:
         config.llm_vision.poe_api_key = poe_key
-
-    target_query = os.environ.get("TARGET_QUERY", "").strip()
-    target_queries = os.environ.get("TARGET_QUERIES", "").strip()
-    if target_queries:
-        parsed = [q.strip() for q in target_queries.split(",") if q.strip()]
-        if parsed:
-            config.target_queries = parsed
-    elif target_query:
-        config.target_queries = [target_query]
 
 
 # ---------------------------------------------------------------------------

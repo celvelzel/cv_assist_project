@@ -65,7 +65,6 @@ class TaskMetricsCollectorTests(unittest.TestCase):
             stable_ready_frames=0,
             gesture="open",
             target_visible=True,
-            target_x=300.0,
             proc_fps_current=30.0,
             proc_fps_avg=28.0,
             e2e_fps_current=24.0,
@@ -74,111 +73,30 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         data.update(overrides)
         return FrameMetrics(**data)
 
-    def test_collector_marks_success_after_ready_then_x_displacement(self):
-        """就绪后目标 X 轴稳定位移触发抓取成功。"""
+    def test_collector_marks_success_after_ready_then_closed(self):
         collector = TaskMetricsCollector(
             grasp_stable_frames=3,
             ready_confirm_window_sec=1.5,
             lost_target_window_sec=5.0,
-            catch_x_min_displacement_px=20,
-            catch_x_stable_frames=3,
-            catch_x_stable_max_std_px=10.0,
         )
         collector.start_task("task_0001", "a bottle", 100.0, "session-1")
         collector.record_voice_metrics(500.0, 120.0, "find bottle")
 
-        # 手部就绪（target_x=300 作为基准）
-        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=True, stable_ready_frames=1, guidance_state="ready", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=True, stable_ready_frames=2, guidance_state="ready", target_x=300.0))
-        # stable_ready_frames=3 时记录 _target_x_at_ready_enter=300
-        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=True, stable_ready_frames=3, guidance_state="ready", target_x=300.0))
-        # 目标 X 发生横向移动，模拟被抓住后带动位置变化
-        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=True, stable_ready_frames=4, guidance_state="ready", target_x=268.0))
-        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=True, stable_ready_frames=5, guidance_state="ready", target_x=270.0))
-        # 第三帧稳定：位移=30px > 20px，std 约 1px < 10px → 触发成功
-        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=True, stable_ready_frames=6, guidance_state="ready", target_x=269.0))
+        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=True, stable_ready_frames=1, guidance_state="ready"))
+        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=True, stable_ready_frames=2, guidance_state="ready"))
+        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=True, stable_ready_frames=3, guidance_state="ready"))
+        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.6, ready_to_grab=True, stable_ready_frames=4, guidance_state="grabbed", gesture="closed"))
 
         self.assertEqual(collector.should_finish_task(), "success")
         report = collector.finish_task("success", 101.0)
 
+        self.assertEqual(report["task_info"]["section"]["zh"], "任务信息")
         self.assertEqual(report["task_info"]["end_reason"]["value"], "success")
         self.assertEqual(report["task_info"]["end_reason"]["value_zh"], "成功完成")
         self.assertEqual(report["task_info"]["task_state"]["value_zh"], "已结束")
         self.assertEqual(report["voice_summary"]["raw_text"]["value"], "find bottle")
+        self.assertEqual(report["voice_summary"]["raw_text"]["zh"], "语音原文")
         self.assertTrue(report["completion_summary"]["closed_after_ready_flag"]["value"])
-        self.assertEqual(report["completion_summary"]["catch_trigger"]["value"], "target_x_displacement")
-        self.assertIsNotNone(report["completion_summary"]["target_x_displacement_px"]["value"])
-        self.assertGreaterEqual(report["completion_summary"]["target_x_displacement_px"]["value"], 20.0)
-        self.assertGreater(report["completion_summary"]["ready_to_catch_elapsed_sec"]["value"], 0.0)
-
-    def test_collector_does_not_trigger_success_without_sufficient_displacement(self):
-        """位移未达阈值时不应触发成功。"""
-        collector = TaskMetricsCollector(
-            grasp_stable_frames=3,
-            ready_confirm_window_sec=1.5,
-            lost_target_window_sec=5.0,
-            catch_x_min_displacement_px=40,
-            catch_x_stable_frames=3,
-            catch_x_stable_max_std_px=10.0,
-        )
-        collector.start_task("task_0001b", "a cup", 100.0, "session-1")
-
-        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=True, stable_ready_frames=1, guidance_state="ready", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=True, stable_ready_frames=2, guidance_state="ready", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=True, stable_ready_frames=3, guidance_state="ready", target_x=300.0))
-        # 目标只移动了 10px，低于 40px 阈值
-        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=True, stable_ready_frames=4, guidance_state="ready", target_x=291.0))
-        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=True, stable_ready_frames=5, guidance_state="ready", target_x=290.0))
-        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=True, stable_ready_frames=6, guidance_state="ready", target_x=291.0))
-
-        self.assertIsNone(collector.should_finish_task())
-
-    def test_collector_can_finish_by_x_move_after_leaving_ready(self):
-        """进入 ready 后即使退出 ready，只要目标 X 位移稳定达标仍应判定成功。"""
-        collector = TaskMetricsCollector(
-            grasp_stable_frames=3,
-            ready_confirm_window_sec=1.0,
-            lost_target_window_sec=5.0,
-            catch_x_min_displacement_px=20,
-            catch_x_stable_frames=3,
-            catch_x_stable_max_std_px=10.0,
-        )
-        collector.start_task("task_0001c", "a can", 100.0, "session-1")
-
-        # 先进入 ready，建立位移基准 X=300
-        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=True, stable_ready_frames=1, guidance_state="ready", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=True, stable_ready_frames=2, guidance_state="ready", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=True, stable_ready_frames=3, guidance_state="ready", target_x=300.0))
-
-        # 抓取动作后短暂离开 ready（例如遮挡/抖动），但目标已发生横向稳定移动
-        collector.record_frame(self._frame(frame_index=4, frame_end_ts=101.8, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=269.0))
-        collector.record_frame(self._frame(frame_index=5, frame_end_ts=101.9, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=270.0))
-        collector.record_frame(self._frame(frame_index=6, frame_end_ts=102.0, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=268.0))
-
-        self.assertEqual(collector.should_finish_task(), "success")
-
-    def test_collector_can_finish_by_x_move_without_ready(self):
-        """未进入 ready（例如手未检测到）时，目标 X 稳定位移也可触发成功。"""
-        collector = TaskMetricsCollector(
-            grasp_stable_frames=3,
-            ready_confirm_window_sec=1.0,
-            lost_target_window_sec=5.0,
-            catch_x_min_displacement_px=20,
-            catch_x_stable_frames=3,
-            catch_x_stable_max_std_px=10.0,
-        )
-        collector.start_task("task_0001d", "a bottle", 100.0, "session-1")
-
-        # 全程不进入 ready，使用任务开始时的目标位置作为位移基准
-        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
-
-        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=268.0))
-        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=269.0))
-        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=270.0))
-
-        self.assertEqual(collector.should_finish_task(), "success")
 
     def test_collector_marks_lost_target_after_threshold(self):
         collector = TaskMetricsCollector(
@@ -220,7 +138,7 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         self.assertEqual(report["task_info"]["end_reason"]["value"], "error")
         self.assertEqual(report["error_summary"]["message"]["value"], "camera disconnected")
 
-    def test_terminal_summary_is_compact_line(self):
+    def test_terminal_summary_is_multiline(self):
         collector = TaskMetricsCollector(
             grasp_stable_frames=3,
             ready_confirm_window_sec=1.5,
@@ -244,14 +162,14 @@ class TaskMetricsCollectorTests(unittest.TestCase):
 
         summary = collector.build_terminal_summary(475.6)
 
-        self.assertIn("[task]", summary)
-        self.assertIn("task_0004", summary)
-        self.assertIn("a bottle", summary)
-        self.assertIn("ready(就绪)", summary)
-        self.assertIn("fps=", summary)
-        self.assertIn("det=", summary)
-        self.assertIn("ready=", summary)
-        self.assertEqual(summary.count("\n"), 0)
+        self.assertIn("[task_metrics]\n", summary)
+        self.assertIn("task_id=task_0004 任务ID", summary)
+        self.assertIn("target=a bottle 当前目标主体", summary)
+        self.assertIn("task_state=ready(就绪) 任务状态", summary)
+        self.assertIn("voice_total_time_ms=10611.5 语音总耗时毫秒", summary)
+        self.assertIn("target_detect_hit_rate=", summary)
+        self.assertIn("目标命中率", summary)
+        self.assertGreaterEqual(summary.count("\n"), 15)
 
 
 class AsyncReportWriterTests(unittest.TestCase):

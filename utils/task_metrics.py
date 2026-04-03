@@ -6,12 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import queue
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
@@ -49,7 +47,6 @@ class FrameMetrics:
     stable_ready_frames: int
     gesture: str
     target_visible: bool
-    target_x: float          # 目标中心 X 坐标（像素），无目标时为 float('nan')
     proc_fps_current: float
     proc_fps_avg: float
     e2e_fps_current: float
@@ -75,16 +72,10 @@ class TaskMetricsCollector:
         grasp_stable_frames: int,
         ready_confirm_window_sec: float,
         lost_target_window_sec: float,
-        catch_x_min_displacement_px: int = 25,
-        catch_x_stable_frames: int = 5,
-        catch_x_stable_max_std_px: float = 12.0,
     ):
         self.grasp_stable_frames = max(1, int(grasp_stable_frames))
         self.ready_confirm_window_sec = max(0.5, float(ready_confirm_window_sec))
         self.lost_target_window_sec = max(0.5, float(lost_target_window_sec))
-        self.catch_x_min_displacement_px = max(1, int(catch_x_min_displacement_px))
-        self.catch_x_stable_frames = max(1, int(catch_x_stable_frames))
-        self.catch_x_stable_max_std_px = max(0.0, float(catch_x_stable_max_std_px))
         self.reset()
 
     def reset(self):
@@ -125,13 +116,6 @@ class TaskMetricsCollector:
         self.first_guidance_ts = None
         self.first_ready_ts = None
         self.first_grabbed_ts = None
-        # X 轴位移抓取判定追踪
-        self._target_x_at_task_start: float = float('nan')
-        self._target_x_at_ready_enter: float = float('nan')
-        self._target_x_window: deque = deque(maxlen=max(self.catch_x_stable_frames * 2, 10))
-        self._catch_trigger: str = ""
-        self.target_x_at_catch: float = float('nan')
-        self.ready_to_catch_elapsed_sec: float = 0.0
 
     def start_task(self, task_id: str, target_query: str, start_time: float, session_id: str):
         self.reset()
@@ -183,13 +167,14 @@ class TaskMetricsCollector:
 
         if frame_metrics.target_visible and self.first_target_detected_ts is None:
             self.first_target_detected_ts = frame_metrics.frame_end_ts
-            if not math.isnan(frame_metrics.target_x):
-                self._target_x_at_task_start = frame_metrics.target_x
         if frame_metrics.has_guidance and self.first_guidance_ts is None:
             self.first_guidance_ts = frame_metrics.frame_end_ts
         if frame_metrics.ready_to_grab and self.first_ready_ts is None:
             self.first_ready_ts = frame_metrics.frame_end_ts
-        if frame_metrics.guidance_state == "grabbed" and self.first_grabbed_ts is None:
+        if (
+            frame_metrics.guidance_state == "grabbed"
+            or frame_metrics.gesture == "closed"
+        ) and self.first_grabbed_ts is None:
             self.first_grabbed_ts = frame_metrics.frame_end_ts
 
         self._update_completion_state(frame_metrics)
@@ -217,53 +202,35 @@ class TaskMetricsCollector:
                     self.ready_enter_ts + self.ready_confirm_window_sec
                 )
                 self.task_state = "ready"
-                # 記錄進入就緒狀態時的目標 X 座標作為位移基準
-                if not math.isnan(frame_metrics.target_x):
-                    self._target_x_at_ready_enter = frame_metrics.target_x
-                self._target_x_window.clear()
         else:
             self.ready_streak = 0
 
-        # 允许两种位移基准：
-        # 1) ready 基准（优先）
-        # 2) 任务开始后首次目标位置基准（无手/未进入 ready 时的兜底）
-        base_x = self._target_x_at_ready_enter
-        base_ts = self.ready_enter_ts
-        trigger_name = "target_x_displacement_ready"
-        if math.isnan(base_x):
-            base_x = self._target_x_at_task_start
-            base_ts = self.first_target_detected_ts
-            trigger_name = "target_x_displacement_task_start"
+        if (
+            self.ready_enter_ts is not None
+            and self.ready_window_deadline_ts is not None
+            and frame_metrics.frame_end_ts > self.ready_window_deadline_ts
+            and not self.closed_after_ready_flag
+        ):
+            self.ready_enter_ts = None
+            self.ready_window_deadline_ts = None
+            self.ready_streak = 0
+            self.task_state = "running"
 
-        if math.isnan(base_x):
+        if self.ready_window_deadline_ts is None:
             return
 
-        # 累積目標 X 座標樣本（ready 之后只要目標可見即可）
-        if not math.isnan(frame_metrics.target_x):
-            self._target_x_window.append(frame_metrics.target_x)
+        in_window = frame_metrics.frame_end_ts <= self.ready_window_deadline_ts
+        if not in_window:
+            return
 
-        # 抓取成功判定：目標 X 軸穩定位移（左右方向）
-        if (
-            len(self._target_x_window) >= self.catch_x_stable_frames
+        # 仅在当前帧手部仍处于对准就绪状态时，才允许 closed/grabbed 触发成功
+        hand_still_ready = frame_metrics.ready_to_grab
+        if hand_still_ready and (
+            frame_metrics.gesture == "closed" or frame_metrics.guidance_state == "grabbed"
         ):
-            recent_xs = list(self._target_x_window)[-self.catch_x_stable_frames:]
-            mean_x = sum(recent_xs) / len(recent_xs)
-            variance = sum((x - mean_x) ** 2 for x in recent_xs) / len(recent_xs)
-            std_x = math.sqrt(variance)
-            displacement = abs(mean_x - base_x)
-
-            if (
-                displacement >= self.catch_x_min_displacement_px
-                and std_x <= self.catch_x_stable_max_std_px
-            ):
-                self._catch_trigger = trigger_name
-                self.target_x_at_catch = mean_x
-                self.ready_to_catch_elapsed_sec = (
-                    frame_metrics.frame_end_ts - (base_ts or frame_metrics.frame_end_ts)
-                )
-                self.closed_after_ready_flag = True
-                self.pending_end_reason = self.pending_end_reason or "success"
-                self.task_state = "finishing"
+            self.closed_after_ready_flag = True
+            self.pending_end_reason = self.pending_end_reason or "success"
+            self.task_state = "finishing"
 
     def should_finish_task(self) -> Optional[str]:
         return self.pending_end_reason
@@ -362,25 +329,7 @@ class TaskMetricsCollector:
                 "ready_streak": self._field_entry("ready_streak", "连续就绪帧数", self.ready_streak),
                 "ready_enter_ts": self._field_entry("ready_enter_ts", "进入就绪窗口时间戳", self.ready_enter_ts),
                 "ready_window_deadline_ts": self._field_entry("ready_window_deadline_ts", "就绪确认截止时间戳", self.ready_window_deadline_ts),
-                "closed_after_ready_flag": self._field_entry("closed_after_ready_flag", "窗口内是否完成抓取确认", self.closed_after_ready_flag),
-                "catch_trigger": self._field_entry("catch_trigger", "抓取触发方式", self._catch_trigger),
-                "target_x_at_ready_enter": self._field_entry(
-                    "target_x_at_ready_enter", "就绪进入时目标X坐标(像素)",
-                    None if math.isnan(self._target_x_at_ready_enter) else round(self._target_x_at_ready_enter, 1),
-                ),
-                "target_x_at_catch": self._field_entry(
-                    "target_x_at_catch", "抓取确认时目标X坐标(像素)",
-                    None if math.isnan(self.target_x_at_catch) else round(self.target_x_at_catch, 1),
-                ),
-                "target_x_displacement_px": self._field_entry(
-                    "target_x_displacement_px", "目标横向位移(像素)",
-                    None if (math.isnan(self._target_x_at_ready_enter) or math.isnan(self.target_x_at_catch))
-                    else round(abs(self.target_x_at_catch - self._target_x_at_ready_enter), 1),
-                ),
-                "ready_to_catch_elapsed_sec": self._field_entry(
-                    "ready_to_catch_elapsed_sec", "就绪到抓取确认耗时秒",
-                    round(self.ready_to_catch_elapsed_sec, 3),
-                ),
+                "closed_after_ready_flag": self._field_entry("closed_after_ready_flag", "窗口内是否闭合确认", self.closed_after_ready_flag),
             },
             "error_summary": {
                 "section": self._section_meta("error_summary", "错误摘要"),
@@ -392,59 +341,40 @@ class TaskMetricsCollector:
         return report
 
     def build_terminal_summary(self, now: float) -> str:
-        """Compact single-line periodic status shown during an active task."""
         if not self.active or self.latest_frame_metrics is None:
             return ""
 
-        elapsed = max(0.0, now - (self.start_time or now))
+        elapsed = max(0.0, now - self.start_time)
         latest = self.latest_frame_metrics
         frames = max(1, self.total_frames)
-        state_label = self._translate_task_state(self.task_state)
-        det_avg = self._avg(self.detection_time_sum_ms, frames)
-        ready_pct = int(self._ratio(self.ready_frames, frames) * 100)
-        return (
-            f"[task] {self.task_id} | {self.target_query} | "
-            f"{self.task_state}({state_label}) | {elapsed:.0f}s | "
-            f"fps={latest.proc_fps_avg:.1f} | det={det_avg:.0f}ms | ready={ready_pct}%"
-        )
-
-    def build_success_console_report(self, report_path: str = "") -> str:
-        """Concise multiline report printed to console when a task ends with success."""
-        elapsed = max(0.0, (self.end_time or 0.0) - (self.start_time or 0.0))
-        frames = max(1, self.total_frames)
-
-        def _rel(ts: Optional[float]) -> str:
-            if ts is None or self.start_time is None:
-                return "N/A"
-            return f"+{ts - self.start_time:.1f}s"
-
-        displacement: Optional[float] = None
-        if not (math.isnan(self.target_x_at_catch) or math.isnan(self._target_x_at_ready_enter)):
-            displacement = round(abs(self.target_x_at_catch - self._target_x_at_ready_enter), 1)
-
-        fps_avg = self.latest_frame_metrics.proc_fps_avg if self.latest_frame_metrics else 0.0
-        det_avg = self._avg(self.detection_time_sum_ms, frames)
-        path_line = f"  report       : {report_path}" if report_path else ""
-
-        parts = [
-            "=" * 56,
-            "  [SUCCESS] 抓取任务完成",
-            "=" * 56,
-            f"  task_id      : {self.task_id}",
-            f"  target       : {self.target_query}",
-            f"  total_time   : {elapsed:.1f}s  ({frames} frames)",
-            f"  first_ready  : {_rel(self.first_ready_ts)}",
-            f"  catch_trigger: {self._catch_trigger or 'N/A'}",
-            f"  x_displace   : {displacement}px" if displacement is not None else "  x_displace   : N/A",
-            f"  ready→catch  : {self.ready_to_catch_elapsed_sec:.2f}s",
-            f"  det_avg_ms   : {det_avg:.0f}",
-            f"  proc_fps_avg : {fps_avg:.1f}",
-            f"  voice_asr_ms : {self.voice_asr_time_ms:.0f}",
+        task_state_label = self._translate_task_state(self.task_state)
+        lines = [
+            "[task_metrics]",
+            f"task_id={self.task_id} 任务ID",
+            f"target={self.target_query} 当前目标主体",
+            f"task_state={self.task_state}({task_state_label}) 任务状态",
+            f"task_elapsed_sec={elapsed:.1f} 任务耗时秒",
+            "",
+            f"voice_total_time_ms={self.voice_total_time_ms:.1f} 语音总耗时毫秒",
+            f"voice_asr_time_ms={self.voice_asr_time_ms:.1f} 语音识别耗时毫秒",
+            "",
+            f"proc_fps_current={latest.proc_fps_current:.1f} 当前处理FPS",
+            f"proc_fps_avg={latest.proc_fps_avg:.1f} 平均处理FPS",
+            f"e2e_fps_current={latest.e2e_fps_current:.1f} 当前端到端FPS",
+            f"e2e_fps_avg={latest.e2e_fps_avg:.1f} 平均端到端FPS",
+            "",
+            f"capture_time_avg_ms={self._avg(self.capture_time_sum_ms, frames):.1f} 平均采集耗时毫秒",
+            f"process_time_avg_ms={self._avg(self.process_time_sum_ms, frames):.1f} 平均处理耗时毫秒",
+            f"detection_time_avg_ms={self._avg(self.detection_time_sum_ms, frames):.1f} 平均检测耗时毫秒",
+            f"depth_time_avg_ms={self._avg(self.depth_time_sum_ms, frames):.1f} 平均深度估计耗时毫秒",
+            f"guidance_time_avg_ms={self._avg(self.guidance_time_sum_ms, frames):.1f} 平均引导计算耗时毫秒",
+            f"draw_time_avg_ms={self._avg(self.draw_time_sum_ms, frames):.1f} 平均绘制耗时毫秒",
+            "",
+            f"target_detect_hit_rate={self._ratio(self.target_visible_frames, frames):.3f} 目标命中率",
+            f"guidance_generate_rate={self._ratio(self.guidance_frames, frames):.3f} 引导生成率",
+            f"lost_target_since_ts={self.lost_target_since_ts} 目标首次消失时间戳",
         ]
-        if path_line:
-            parts.append(path_line)
-        parts.append("=" * 56)
-        return "\n".join(parts)
+        return "\n".join(lines)
 
     @staticmethod
     def _translate_task_state(task_state: str) -> str:
