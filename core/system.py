@@ -559,6 +559,7 @@ class CVAssistSystem:
 
         now = time.time()
         task_id = self.current_task["task_id"]
+        target_query = self.current_task["target_query"]
         should_emit_report = self.task_metrics_collector.should_emit_report()
         report_dict = self.task_metrics_collector.finish_task(
             end_reason=end_reason,
@@ -580,6 +581,14 @@ class CVAssistSystem:
 
         self.current_task = None
         self.task_state = "idle"
+
+        # 对于预设目标，若任务因丢失结束，则自动回到搜索/确认状态，避免系统停住
+        if end_reason == "lost_target" and target_query in self.config.target_queries:
+            self._pause_target_detection = False
+            self.cached_detections = []
+            self._begin_target_search_feedback(target_query)
+            self._start_task(target_query)
+
         return report_dict
 
     def _update_target_search_feedback(self, detections: List[Dict]):
@@ -1124,7 +1133,7 @@ class CVAssistSystem:
         logger.info(f"检测目标: {self.config.target_queries}")
         logger.info(f"摄像头选择: {camera_id}")
 
-        # 有预设目标时，启动即进入任务态（无需先按 v 语音触发）
+        # 有预设目标时，启动即进入自动搜索/确认态（无需先按 v 语音触发）
         if (
             self.config.target_queries
             and not self.current_task
@@ -1134,7 +1143,7 @@ class CVAssistSystem:
             if preset_target:
                 self._begin_target_search_feedback(preset_target)
                 self._pause_target_detection = False
-                self._start_task_now(preset_target)
+                self._start_task(preset_target)
         
         # 尝试打开摄像头，带异常处理
         try:
