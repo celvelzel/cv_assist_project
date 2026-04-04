@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from typing import Any
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -40,7 +41,7 @@ class VoiceEventParsingTests(unittest.TestCase):
 
 class TaskMetricsCollectorTests(unittest.TestCase):
     def _frame(self, **overrides):
-        data = dict(
+        data: dict[str, Any] = dict(
             frame_index=1,
             frame_start_ts=100.0,
             frame_end_ts=100.1,
@@ -66,6 +67,8 @@ class TaskMetricsCollectorTests(unittest.TestCase):
             gesture="open",
             target_visible=True,
             target_x=300.0,
+            hand_near_target=True,
+            hand_target_distance_px=20.0,
             proc_fps_current=30.0,
             proc_fps_avg=28.0,
             e2e_fps_current=24.0,
@@ -106,7 +109,7 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         self.assertEqual(report["task_info"]["task_state"]["value_zh"], "已结束")
         self.assertEqual(report["voice_summary"]["raw_text"]["value"], "find bottle")
         self.assertTrue(report["completion_summary"]["closed_after_ready_flag"]["value"])
-        self.assertEqual(report["completion_summary"]["catch_trigger"]["value"], "target_x_displacement")
+        self.assertEqual(report["completion_summary"]["catch_trigger"]["value"], "target_x_displacement_ready")
         self.assertIsNotNone(report["completion_summary"]["target_x_displacement_px"]["value"])
         self.assertGreaterEqual(report["completion_summary"]["target_x_displacement_px"]["value"], 20.0)
         self.assertGreater(report["completion_summary"]["ready_to_catch_elapsed_sec"]["value"], 0.0)
@@ -158,7 +161,7 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         self.assertEqual(collector.should_finish_task(), "success")
 
     def test_collector_can_finish_by_x_move_without_ready(self):
-        """未进入 ready（例如手未检测到）时，目标 X 稳定位移也可触发成功。"""
+        """未进入 ready 时，只要手已靠近目标，目标 X 稳定位移也可触发成功。"""
         collector = TaskMetricsCollector(
             grasp_stable_frames=3,
             ready_confirm_window_sec=1.0,
@@ -169,16 +172,37 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         )
         collector.start_task("task_0001d", "a bottle", 100.0, "session-1")
 
-        # 全程不进入 ready，使用任务开始时的目标位置作为位移基准
-        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
-        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0))
+        # 全程不进入 ready，但手已经靠近目标，使用 hand-near 时的目标位置作为位移基准
+        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=True))
+        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=True))
+        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=True))
 
-        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=268.0))
-        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=269.0))
-        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=270.0))
+        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=268.0, hand_near_target=True))
+        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=269.0, hand_near_target=True))
+        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=270.0, hand_near_target=True))
 
         self.assertEqual(collector.should_finish_task(), "success")
+
+    def test_collector_does_not_finish_by_x_move_without_hand_near(self):
+        """若手未靠近目标，即使目标 X 移动也不应触发成功。"""
+        collector = TaskMetricsCollector(
+            grasp_stable_frames=3,
+            ready_confirm_window_sec=1.0,
+            lost_target_window_sec=5.0,
+            catch_x_min_displacement_px=20,
+            catch_x_stable_frames=3,
+            catch_x_stable_max_std_px=10.0,
+        )
+        collector.start_task("task_0001e", "a bottle", 100.0, "session-1")
+
+        collector.record_frame(self._frame(frame_index=1, frame_end_ts=100.1, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=False, hand_target_distance_px=200.0))
+        collector.record_frame(self._frame(frame_index=2, frame_end_ts=100.2, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=False, hand_target_distance_px=200.0))
+        collector.record_frame(self._frame(frame_index=3, frame_end_ts=100.3, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=300.0, hand_near_target=False, hand_target_distance_px=200.0))
+        collector.record_frame(self._frame(frame_index=4, frame_end_ts=100.4, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=268.0, hand_near_target=False, hand_target_distance_px=200.0))
+        collector.record_frame(self._frame(frame_index=5, frame_end_ts=100.5, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=269.0, hand_near_target=False, hand_target_distance_px=200.0))
+        collector.record_frame(self._frame(frame_index=6, frame_end_ts=100.6, ready_to_grab=False, stable_ready_frames=0, guidance_state="moving", target_x=270.0, hand_near_target=False, hand_target_distance_px=200.0))
+
+        self.assertIsNone(collector.should_finish_task())
 
     def test_collector_marks_lost_target_after_threshold(self):
         collector = TaskMetricsCollector(
