@@ -23,7 +23,13 @@ from config import SystemConfig, load_config
 from detectors.owl_vit_detector import OWLViTDetector
 from detectors.hand_tracker import HandTracker
 from detectors.depth_estimator import DepthEstimator
-from core.guidance import GuidanceController, GuidanceResult
+from core.guidance import (
+    GuidanceController,
+    GuidanceResult,
+    approximate_separation_meters,
+    clock_hour_from_hand_to_target,
+    clock_hour_from_horizontal_plane,
+)
 from utils.logger import setup_logging, FPSCounter
 from utils.task_metrics import AsyncReportWriter, FrameMetrics, TaskMetricsCollector, TaskReportEnvelope
 
@@ -157,6 +163,14 @@ class CVAssistSystem:
         else:
             self.fps_counter = None
             self.e2e_fps_counter = None
+
+        self._spatial_briefing_task_id: Optional[str] = None
+        try:
+            from audio.proximity_beep import ProximityBeepPlayer
+            self._proximity_beep = ProximityBeepPlayer()
+        except Exception as e:
+            logger.debug("近距离滴滴声模块未加载: %s", e)
+            self._proximity_beep = None
         
         logger.info("系统初始化完成")
     
@@ -223,6 +237,8 @@ class CVAssistSystem:
             depth_threshold_exit=cfg.guidance.depth_threshold_exit,
             grasp_stable_frames=cfg.guidance.grasp_stable_frames,
             grasp_release_frames=cfg.guidance.grasp_release_frames,
+            depth_instruction_first=cfg.guidance.depth_instruction_first,
+            invert_depth_guidance=cfg.guidance.invert_depth_guidance,
         )
         
         logger.info("所有组件初始化成功")
@@ -311,7 +327,8 @@ class CVAssistSystem:
         self._last_instruction_state = None
         self._last_instruction_ts = 0.0
         self._last_grab_ts = 0.0
-        
+        self._last_guidance_tts_ts = 0.0
+
         # 帧缓冲，用于 LLM Vision 解析（存储最后 4 帧）
         # 在 _handle_voice_input 中使用
         self._frame_buffer = deque(maxlen=self.config.llm_vision.max_frames_for_vision)
@@ -496,6 +513,8 @@ class CVAssistSystem:
                 raw_text=voice_event.get("raw_text", ""),
             )
         logger.info("任务正式激活: task_id=%s target=%s", task_id, target)
+        if self._proximity_beep:
+            self._proximity_beep.reset_cooldown()
         self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
 
     def _start_task_now(self, target: str):
@@ -520,6 +539,8 @@ class CVAssistSystem:
             session_id=self.session_id,
         )
         logger.info("预设目标任务已自动激活: task_id=%s target=%s", task_id, target)
+        if self._proximity_beep:
+            self._proximity_beep.reset_cooldown()
 
     def _update_pending_task_confirmation(self, detections: List[Dict], now: float):
         """主循环每帧调用：根据当前检测结果推进任务开始确认进度。"""
@@ -559,6 +580,9 @@ class CVAssistSystem:
         if not self.current_task:
             self.task_state = "idle"
             return None
+
+        if self._proximity_beep:
+            self._proximity_beep.set_continuous_eligible(False)
 
         now = time.time()
         task_id = self.current_task["task_id"]
@@ -670,6 +694,157 @@ class CVAssistSystem:
 
         return (now - self._last_instruction_ts) >= cfg.tts_instruction_interval_sec
 
+    def _try_spatial_briefing(self, result: FrameResult, hand_stable: bool) -> None:
+        """任务开始后首次：播报目标相对手的钟点方向与约略距离，再进入常规定向引导。"""
+        gcfg = self.config.guidance
+        if not getattr(gcfg, "enable_spatial_briefing", True):
+            return
+        if not self.current_task or not self.tts_engine:
+            return
+        if self._voice_in_progress or self._voice_prompt_playing:
+            return
+        tid = self.current_task["task_id"]
+        if self._spatial_briefing_task_id == tid:
+            return
+        if not hand_stable or not result.has_guidance or not result.guidance:
+            return
+        g = result.guidance
+        mode = str(getattr(gcfg, "clock_mode", "horizontal_plane") or "horizontal_plane").strip().lower()
+        if mode == "image_plane":
+            hour = clock_hour_from_hand_to_target(
+                g.dx,
+                g.dy,
+                flip_horizontal=bool(getattr(gcfg, "clock_flip_horizontal", False)),
+            )
+        else:
+            hour = clock_hour_from_horizontal_plane(
+                g.dx,
+                g.depth_diff,
+                flip_horizontal=bool(getattr(gcfg, "clock_flip_horizontal", False)),
+                depth_scale=float(getattr(gcfg, "clock_horizontal_depth_scale", 450.0)),
+                depth_axis_sign=float(getattr(gcfg, "clock_horizontal_depth_axis_sign", 1.0)),
+            )
+        meters = approximate_separation_meters(
+            g.dx,
+            g.dy,
+            g.depth_diff,
+            gcfg.spatial_briefing_distance_min_m,
+            gcfg.spatial_briefing_distance_max_m,
+            gcfg.spatial_briefing_ref_diagonal_px,
+            px_weight=float(getattr(gcfg, "spatial_briefing_px_weight", 0.68)),
+            depth_weight=float(getattr(gcfg, "spatial_briefing_depth_weight", 0.32)),
+            depth_span=float(getattr(gcfg, "spatial_briefing_depth_span", 0.52)),
+            distance_gamma=float(getattr(gcfg, "spatial_briefing_distance_gamma", 1.12)),
+        )
+        text = (
+            f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
+            f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
+        )
+        self._speak_priority_message(text)
+        self._spatial_briefing_task_id = tid
+
+    def _proximity_density_t(self, distance_px: float, depth_diff: float) -> float:
+        """0=手与目标在画面上很近且深度差小（滴滴最密），1=远或未对准深度（滴滴最疏）。"""
+        acfg = self.config.audio
+        far_px = max(1.0, float(acfg.proximity_beep_far_px))
+        near_px = max(0.0, min(float(acfg.proximity_beep_near_px), far_px - 1.0))
+        d = float(distance_px)
+        span = far_px - near_px
+        if span <= 0:
+            t_geom = 0.0
+        else:
+            t_geom = max(0.0, min(1.0, (d - near_px) / span))
+        if getattr(acfg, "proximity_beep_use_depth_in_density", True):
+            depth_span = max(1e-6, float(getattr(acfg, "proximity_beep_depth_diff_span", 0.22)))
+            t_depth = min(1.0, abs(float(depth_diff)) / depth_span)
+            return max(t_geom, t_depth)
+        return t_geom
+
+    def _pygame_music_busy(self) -> bool:
+        try:
+            import pygame
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _update_proximity_beep(self, result: FrameResult, now: float) -> None:
+        """任务开始若干秒后，按手与目标接近程度播放滴滴声（连续模式下疏密随 density_t 变化）。"""
+        acfg = self.config.audio
+        player = getattr(self, "_proximity_beep", None)
+        if player is None:
+            return
+        if not getattr(acfg, "proximity_beep_enabled", False):
+            player.set_continuous_eligible(False)
+            return
+        blocked = (
+            self._voice_in_progress
+            or self._voice_prompt_playing
+            or self._lifecycle_speaking
+        )
+        if blocked or not self.current_task:
+            player.set_continuous_eligible(False)
+            return
+        if getattr(acfg, "proximity_beep_pause_while_guidance_suppress", True):
+            if now < float(self._suppress_guidance_until_ts):
+                player.set_continuous_eligible(False)
+                return
+        if getattr(acfg, "proximity_beep_pause_while_pygame_music_busy", True):
+            if self._pygame_music_busy():
+                player.set_continuous_eligible(False)
+                return
+        sup_g = float(getattr(acfg, "proximity_beep_suppress_after_guidance_sec", 0.0) or 0.0)
+        if sup_g > 0.0 and (now - float(self._last_guidance_tts_ts)) < sup_g:
+            player.set_continuous_eligible(False)
+            return
+        if not result.has_hand or not result.has_guidance or not result.guidance:
+            player.set_continuous_eligible(False)
+            return
+        if acfg.proximity_beep_stop_when_ready and result.guidance.ready_to_grab:
+            player.set_continuous_eligible(False)
+            return
+        dpx = result.hand_target_distance_px
+        if dpx != dpx:  # NaN
+            player.set_continuous_eligible(False)
+            return
+
+        density_t = self._proximity_density_t(dpx, result.guidance.depth_diff)
+
+        if getattr(acfg, "proximity_beep_continuous", True):
+            player.update_continuous(
+                now=now,
+                density_t=density_t,
+                start_delay_sec=float(acfg.proximity_beep_start_delay_sec),
+                task_start_ts=float(self.current_task["start_time"]),
+                frequency_hz=int(acfg.proximity_beep_frequency_hz),
+                duration_ms=int(acfg.proximity_beep_duration_ms),
+                gap_min_ms=float(acfg.proximity_beep_continuous_gap_min_ms),
+                gap_max_ms=float(acfg.proximity_beep_continuous_gap_max_ms),
+                chunk_pulses=int(acfg.proximity_beep_continuous_chunk_pulses),
+                sample_rate=int(getattr(acfg, "proximity_beep_sample_rate", 44100) or 44100),
+                backend=str(getattr(acfg, "proximity_beep_backend", "sounddevice") or "sounddevice"),
+                volume=float(getattr(acfg, "proximity_beep_volume", 0.58) or 0.58),
+            )
+            return
+
+        player.set_continuous_eligible(False)
+        player.maybe_beep(
+            now,
+            dpx,
+            enabled=True,
+            start_delay_sec=float(acfg.proximity_beep_start_delay_sec),
+            task_start_ts=float(self.current_task["start_time"]),
+            min_interval=float(acfg.proximity_beep_min_interval_sec),
+            max_interval=float(acfg.proximity_beep_max_interval_sec),
+            far_px=float(acfg.proximity_beep_far_px),
+            near_px=float(acfg.proximity_beep_near_px),
+            frequency_hz=int(acfg.proximity_beep_frequency_hz),
+            duration_ms=int(acfg.proximity_beep_duration_ms),
+            backend=str(getattr(acfg, "proximity_beep_backend", "sounddevice") or "sounddevice"),
+            sample_rate=int(getattr(acfg, "proximity_beep_sample_rate", 44100) or 44100),
+        )
+
     def _speak_guidance(self, guidance: GuidanceResult):
         """播放当前引导并更新节流状态。"""
         if not self.tts_engine:
@@ -678,6 +853,7 @@ class CVAssistSystem:
         state = self._guidance_state(guidance)
         now = time.time()
         self.tts_engine.speak_instruction(guidance.instruction)
+        self._last_guidance_tts_ts = now
         self._last_instruction = guidance.instruction
         self._last_instruction_state = state
         self._last_instruction_ts = now
@@ -1207,13 +1383,15 @@ class CVAssistSystem:
                     ret, frame = cap.read()
                 except cv2.error as e:
                     logger.warning(f"摄像头读取错误: {e}")
-                    exit_reason = 'error'
+                    exit_reason = 'camera_error'
+                    logger.info("主循环结束: 摄像头读取异常")
                     break
                 capture_time_ms = (time.perf_counter() - capture_start) * 1000
                 
                 if not ret:
                     logger.warning("无法读取摄像头帧，可能摄像头已断开")
-                    exit_reason = 'error'
+                    exit_reason = 'camera_lost'
+                    logger.info("主循环结束: 摄像头读帧失败")
                     break
                 
                 # 水平翻转图像（镜像效果）
@@ -1243,9 +1421,15 @@ class CVAssistSystem:
                     )))
                     hand_is_stable = self._hand_stable_streak >= hand_stable_threshold
                     if self.current_task and hand_is_stable and self.tts_engine and result.guidance:
+                        self._try_spatial_briefing(result, hand_is_stable)
+                    if self.current_task and hand_is_stable and self.tts_engine and result.guidance:
                         if self._should_speak_guidance(result.guidance):
                             self._speak_guidance(result.guidance)
-                    
+                    if self.current_task:
+                        self._update_proximity_beep(result, time.time())
+                    elif self._proximity_beep:
+                        self._proximity_beep.set_continuous_eligible(False)
+
                     proc_stats = {}
                     if self.fps_counter:
                         self.fps_counter.update(frame_time_ms=result.total_time_ms)
@@ -1284,9 +1468,18 @@ class CVAssistSystem:
                     output[0:120, -160:] = depth_vis  # 放在右上角
                 
                 try:
-                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    vis = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
+                    if vis < 1:
+                        exit_reason = 'window_closed'
+                        logger.info(
+                            "主循环结束: 视频窗口已关闭或变为不可见 (WND_PROP_VISIBLE=%s)。"
+                            "若未主动关窗口，可能是误点「×」、最小化或显示驱动/OpenCV 高 GUI 异常。",
+                            vis,
+                        )
                         break
-                except cv2.error:
+                except cv2.error as e:
+                    exit_reason = 'window_closed'
+                    logger.info("主循环结束: 无法查询窗口状态，视为窗口已关闭 (%s)", e)
                     break
 
                 display_start = time.perf_counter()
@@ -1296,7 +1489,8 @@ class CVAssistSystem:
                 key = cv2.waitKey(1) & 0xFF
                 display_time_ms = (time.perf_counter() - display_start) * 1000
                 if key == ord('q'):
-                    exit_reason = 'error'
+                    exit_reason = 'user_quit'
+                    logger.info("主循环结束: 用户按下 q 键退出")
                     break
                 elif key == ord('d'):
                     show_depth = not show_depth
@@ -1340,16 +1534,25 @@ class CVAssistSystem:
                         self._maybe_log_task_summary()
 
                 if self._requested_shutdown:
+                    exit_reason = 'voice_exit'
+                    logger.info("主循环结束: 语音指令请求退出程序")
                     break
         except KeyboardInterrupt:
             logger.info("收到键盘中断信号")
-            exit_reason = 'error'
+            exit_reason = 'interrupt'
         except Exception as e:
             logger.exception(f"运行过程中发生异常: {e}")
             exit_reason = 'error'
         finally:
+            if exit_reason:
+                logger.info("本次运行退出原因: %s", exit_reason)
             if self.current_task:
-                final_reason = exit_reason or 'error'
+                if exit_reason in ('window_closed', 'user_quit', 'voice_exit', 'interrupt'):
+                    final_reason = 'user_exit'
+                elif exit_reason in ('camera_lost', 'camera_error'):
+                    final_reason = 'error'
+                else:
+                    final_reason = exit_reason or 'error'
                 self._finish_current_task(final_reason)
             # 输出最终统计
             if self.fps_counter:

@@ -5,6 +5,7 @@
 """
 
 import cv2
+import math
 import numpy as np
 from typing import Tuple, Optional
 from dataclasses import dataclass
@@ -13,6 +14,98 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
+
+
+def clock_hour_from_hand_to_target(
+    dx: int, dy: int, *, flip_horizontal: bool = False
+) -> int:
+    """以手为表心，目标相对手的钟点方向（1–12）。
+
+    数据：仅使用手部与目标在**同一图像坐标系**下的中心点差值 ``dx = target_x - hand_x``、
+    ``dy = target_y - hand_y``（与 ``GuidanceController.calculate`` 中定义一致）。
+    **不使用深度图**；钟点表示的是像平面上的方位（把屏幕当成表盘：12 点 = 画面正上方）。
+
+    算法：用 ``atan2(dx, -dy)`` 得到相对「向上」的方位角，再按每 30° 一扇区映射到 1–12 点
+    （扇区边界用 floor，比 round 更稳定，减少边界抖动）。
+
+    flip_horizontal=True 时对 dx 取反（例如原始帧未镜像、而钟点要以镜像自拍视角为准时）。
+    """
+    if flip_horizontal:
+        dx = -int(dx)
+    angle_deg = math.degrees(math.atan2(float(dx), float(-dy)))
+    angle_deg = (angle_deg + 360.0) % 360.0
+    sector = int(math.floor((angle_deg + 15.0) / 30.0)) % 12
+    return 12 if sector == 0 else sector
+
+
+def clock_hour_from_horizontal_plane(
+    dx: int,
+    depth_diff: float,
+    *,
+    flip_horizontal: bool = False,
+    depth_scale: float = 450.0,
+    depth_axis_sign: float = 1.0,
+) -> int:
+    """以水平面为表盘估计钟点（1–12），用左右 + 深度差，不用画面上下 dy。
+
+    将目标相对手的位置近似投影到「水平面」：横轴为画面左右偏移 ``dx``（像素），
+    纵轴为 MiDaS 归一化深度差 ``depth_diff = target_depth - hand_depth``（与引导中一致），
+    乘以 ``depth_scale`` 后与 ``dx`` 量级相当，便于 ``atan2`` 合成方向。
+
+    - **12 点**：目标在手的「正前方」一侧（沿深度轴分量为主，dx≈0）。
+    - **3 点**：目标在手的右侧（dx>0，镜像后坐标系下多为用户右手侧）。
+    - **6 点**：主要在深度轴反向。
+    - **9 点**：左侧。
+
+    ``depth_axis_sign`` 若与实际前后感相反，可在配置中改为 -1.0。
+    ``depth_scale`` 越大，同样深度差对钟点角度影响越大。
+    """
+    if flip_horizontal:
+        dx = -int(dx)
+    scale = max(1e-6, float(depth_scale))
+    v = float(depth_diff) * float(depth_axis_sign) * scale
+    angle_deg = math.degrees(math.atan2(float(dx), float(v)))
+    angle_deg = (angle_deg + 360.0) % 360.0
+    sector = int(math.floor((angle_deg + 15.0) / 30.0)) % 12
+    return 12 if sector == 0 else sector
+
+
+def approximate_separation_meters(
+    dx: int,
+    dy: int,
+    depth_diff: float,
+    min_m: float,
+    max_m: float,
+    ref_diagonal_px: float,
+    *,
+    px_weight: float = 0.68,
+    depth_weight: float = 0.32,
+    depth_span: float = 0.5,
+    distance_gamma: float = 1.12,
+) -> float:
+    """根据像素间距与相对深度差给出「约 X 米」的提示值（启发式，非真实测距）。
+
+    - ``t_px``：手到目标的像素距离 / ``ref_diagonal_px``，截断到 [0,1]。
+    - ``t_d``：``|depth_diff| / depth_span``，截断到 [0,1]（不再用 ``*2`` 以免深度项过快顶满）。
+    - ``t = px_weight * t_px + depth_weight * t_d``，再 ``t ** distance_gamma``（默认略>1，整体略压低报数，减轻「偏大」体感）。
+    单目 MiDaS 仅为相对深度，米数仅供口头参考，请用配置微调。
+    """
+    px = math.hypot(float(dx), float(dy))
+    denom = max(1.0, float(ref_diagonal_px))
+    t_px = min(1.0, px / denom)
+    span = max(1e-6, float(depth_span))
+    t_d = min(1.0, abs(float(depth_diff)) / span)
+    wp = max(0.0, float(px_weight))
+    wd = max(0.0, float(depth_weight))
+    s = wp + wd
+    if s <= 0:
+        t = (t_px + t_d) / 2.0
+    else:
+        t = (wp * t_px + wd * t_d) / s
+    t = max(0.0, min(1.0, t))
+    g = max(0.05, float(distance_gamma))
+    t = t**g
+    return float(min_m + t * (max_m - min_m))
 
 
 @dataclass
@@ -60,7 +153,9 @@ class GuidanceController:
                  depth_threshold_enter: Optional[float] = None,
                  depth_threshold_exit: Optional[float] = None,
                  grasp_stable_frames: int = 8,
-                 grasp_release_frames: int = 3):
+                 grasp_release_frames: int = 3,
+                 depth_instruction_first: bool = False,
+                 invert_depth_guidance: bool = False):
         """
         初始化引导控制器
         
@@ -69,6 +164,8 @@ class GuidanceController:
                                  在此范围内认为已对齐
             vertical_threshold: 垂直方向的容差阈值（像素）
             depth_threshold: 深度方向的容差阈值 (0-1)
+            depth_instruction_first: 为 True 时，移动指令优先播报前后，再上下/左右
+            invert_depth_guidance: True 时对深度差取反再判定前后
         """
         self.h_thresh = horizontal_threshold
         self.v_thresh = vertical_threshold
@@ -81,6 +178,8 @@ class GuidanceController:
         self.d_exit = depth_threshold_exit if depth_threshold_exit is not None else depth_threshold
         self.grasp_stable_frames = max(1, int(grasp_stable_frames))
         self.grasp_release_frames = max(1, int(grasp_release_frames))
+        self.depth_instruction_first = bool(depth_instruction_first)
+        self.invert_depth_guidance = bool(invert_depth_guidance)
 
         # 状态缓存用于滞回与稳定帧判定
         self._prev_dir_h = 'center'
@@ -130,8 +229,11 @@ class GuidanceController:
         # 计算位置差异
         dx = target_center[0] - hand_center[0]  # 水平偏移（正值=目标在右）
         dy = target_center[1] - hand_center[1]  # 垂直偏移（正值=目标在下）
-        dd = target_depth - hand_depth          # 深度差（正值=目标更远）
-        
+        # MiDaS 归一化深度：同一帧内数值越大通常越靠近相机（见 depth_estimator 伪彩说明）
+        dd = target_depth - hand_depth  # 正值≈目标比手更靠近镜头
+        if self.invert_depth_guidance:
+            dd = -dd
+
         # 使用滞回阈值判定方向，减少边界来回跳变
         dir_h = self._direction_with_hysteresis(
             dx, self._prev_dir_h, self.h_enter, self.h_exit, 'right', 'left', 'center'
@@ -177,14 +279,18 @@ class GuidanceController:
                 instruction = "准备抓取!"
                 state = 'ready'
         else:
-            # 未就位，创建移动指令
-            parts = []
+            # 未就位，创建移动指令（可按配置优先播报前后移动）
+            parts_h, parts_v, parts_d = [], [], []
             if dir_h != 'center':
-                parts.append(f"向{self._translate(dir_h)}移动")
+                parts_h.append(f"向{self._translate(dir_h)}移动")
             if dir_v != 'center':
-                parts.append(f"向{self._translate(dir_v)}移动")
+                parts_v.append(f"向{self._translate(dir_v)}移动")
             if dir_d != 'hold':
-                parts.append(f"向{self._translate(dir_d)}移动")
+                parts_d.append(f"向{self._translate(dir_d)}移动")
+            if self.depth_instruction_first:
+                parts = parts_d + parts_v + parts_h
+            else:
+                parts = parts_h + parts_v + parts_d
             instruction = " | ".join(parts) if parts else "保持位置"
             state = 'moving'
         

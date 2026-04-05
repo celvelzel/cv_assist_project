@@ -6,7 +6,11 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from core.guidance import GuidanceController
+from core.guidance import (
+    GuidanceController,
+    clock_hour_from_hand_to_target,
+    clock_hour_from_horizontal_plane,
+)
 
 
 class GuidanceStabilityTests(unittest.TestCase):
@@ -63,6 +67,25 @@ class GuidanceStabilityTests(unittest.TestCase):
 
         self.assertEqual(first.direction_h, "right")
         self.assertEqual(second.direction_h, "right")
+
+    def test_clock_hour_twelve_and_three(self):
+        self.assertEqual(clock_hour_from_hand_to_target(0, -50), 12)
+        self.assertEqual(clock_hour_from_hand_to_target(50, 0), 3)
+
+    def test_clock_flip_horizontal(self):
+        self.assertEqual(clock_hour_from_hand_to_target(50, 0, flip_horizontal=True), 9)
+
+    def test_clock_horizontal_twelve_and_three(self):
+        # 仅深度轴（v>0）、无左右 → 12 点
+        self.assertEqual(
+            clock_hour_from_horizontal_plane(0, 0.01, depth_scale=450.0, depth_axis_sign=1.0),
+            12,
+        )
+        # 仅右侧、无深度差 → 3 点
+        self.assertEqual(
+            clock_hour_from_horizontal_plane(50, 0.0, depth_scale=450.0, depth_axis_sign=1.0),
+            3,
+        )
 
 
 if __name__ == "__main__":

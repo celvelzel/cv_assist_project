@@ -261,6 +261,53 @@ class GuidanceConfig:
     # 效果: 避免手部短暂入画时立即播报，减少误触发。
     # 推荐: 5 帧（约 0.17 秒 @ 30fps）。
 
+    # ---- 初始空间简报（钟点方向 + 约 X 米）----
+
+    enable_spatial_briefing: bool = True
+    # 任务开始后、常规移动引导播报之前，先播一次「目标在手的几点钟方向、约多少米」。
+    # 距离为结合像素间距与 MiDaS 相对深度的启发式估值，仅作辅助提示。
+    # 钟点方向：默认「水平面表盘」——左右用手与目标的 dx，前后用深度差 depth_diff（见 clock_mode）。
+
+    spatial_briefing_distance_min_m: float = 0.12
+    # 简报中「约 X 米」的下限（米）。
+
+    spatial_briefing_distance_max_m: float = 0.95
+    # 简报中「约 X 米」的上限（米）；单目启发式不宜报过大。
+
+    spatial_briefing_ref_diagonal_px: float = 520.0
+    # 像素距离归一化参考（像素）；越大同样画幅上手目间距对应的「米数」越小。
+
+    spatial_briefing_px_weight: float = 0.68
+    # 「约 X 米」中像素距离项权重（与 depth_weight 会自动归一）。
+
+    spatial_briefing_depth_weight: float = 0.32
+    # 「约 X 米」中深度差项权重。
+
+    spatial_briefing_depth_span: float = 0.52
+    # |depth_diff| 达到约该量级时深度项趋近 1（略大于旧版 *2 的隐含尺度，避免深度一项就把米数顶满）。
+
+    spatial_briefing_distance_gamma: float = 1.12
+    # 对合成 t 做 t**gamma；>1 时同样条件下报数略偏小，可减轻「米数偏大」体感。
+
+    depth_instruction_first: bool = True
+    # 为 True 时，移动引导话术优先播报「向前/向后」（由 MiDaS 相对深度判定），再播上下与左右。
+
+    invert_depth_guidance: bool = False
+    # 若实际体验中前后提示与真实远近相反，可改为 True，对深度差取反后再判定。
+
+    clock_flip_horizontal: bool = False
+    # 钟点简报用的水平方向：默认 False。主程序已对画面做水平镜像时，一般保持 False；
+    # 若你关闭镜像或希望钟点与原始传感器左右一致，可改为 True（对钟点计算取反 dx）。
+
+    clock_mode: str = "horizontal_plane"
+    # 钟点模式："horizontal_plane" = 以水平面为表盘，用 dx + 深度差； "image_plane" = 旧逻辑（dx+dy 像平面）。
+
+    clock_horizontal_depth_scale: float = 450.0
+    # 水平面模式下，将 depth_diff（约 0~1）放大到与 dx（像素）可比的权重；越大深度对钟点影响越大。
+
+    clock_horizontal_depth_axis_sign: float = 1.0
+    # 水平面模式下深度轴符号；若 12 点方向与体感前后相反，改为 -1.0。
+
 
 @dataclass
 class AudioConfig:
@@ -360,6 +407,72 @@ class AudioConfig:
     # MiMo TTS 使用的音色名称。
     # 可选值: 参考 MiMo API 文档中提供的音色列表。
     # 效果: 不同音色有不同的语音风格（男声/女声/童声等）。
+
+    # ---- 近距离滴滴声（倒车雷达式）----
+
+    proximity_beep_enabled: bool = True
+    # 是否在任务进行中，按手与目标的接近程度播放间歇滴滴声。
+
+    proximity_beep_start_delay_sec: float = 5.0
+    # 任务激活后延迟多少秒再开始滴滴声（秒）。
+
+    proximity_beep_min_interval_sec: float = 0.08
+    # 非连续模式下：手非常接近目标时两次滴滴的最小间隔（秒）。
+
+    proximity_beep_max_interval_sec: float = 1.0
+    # 非连续模式下：手远离目标时两次滴滴的最大间隔（秒）。
+
+    proximity_beep_continuous: bool = True
+    # 为 True 时，满足条件后由后台线程持续播放滴滴（仅脉冲间可有极短间隙），不再「响一声停很久」。
+
+    proximity_beep_continuous_gap_min_ms: float = 0.0
+    # 连续模式下，手很近时脉冲之间的静音长度（毫秒）；0 表示紧密相接。
+
+    proximity_beep_continuous_gap_max_ms: float = 260.0
+    # 连续模式下，density_t 接近 1（手离目标远或深度差大）时脉冲间静音（毫秒）；越大越远越稀疏。
+
+    proximity_beep_use_depth_in_density: bool = True
+    # 为 True 时，滴滴疏密同时看像素距离与 |深度差|：仅画面近但前后未对准时仍偏稀疏。
+
+    proximity_beep_depth_diff_span: float = 0.22
+    # 深度差归一化尺度：|depth_diff| 达到该量级时 density_t 的深度项趋近 1（需与 guidance 中深度阈值同量级）。
+
+    proximity_beep_continuous_chunk_pulses: int = 48
+    # 连续模式每段拼接的脉冲个数（越大单次 sd.play 越长，循环开销越小）。
+
+    proximity_beep_frequency_hz: int = 900
+    # 滴滴声频率（赫兹）。
+
+    proximity_beep_duration_ms: int = 70
+    # 单次滴滴持续时间（毫秒）。
+
+    proximity_beep_volume: float = 0.58
+    # 滴滴波形幅度（约 0~1）；过小在 Windows 默认设备上几乎听不见。
+
+    proximity_beep_far_px: float = 280.0
+    # 像素距离大于等于该值时，滴滴最稀疏（使用 max_interval）。
+
+    proximity_beep_near_px: float = 35.0
+    # 像素距离小于等于该值时，滴滴最密（使用 min_interval）。
+
+    proximity_beep_stop_when_ready: bool = True
+    # 为 True 时，进入可抓取对齐状态后停止滴滴声。
+
+    proximity_beep_backend: str = "sounddevice"
+    # 滴滴声输出：sounddevice（推荐，与 MiMo 的 pygame.music 不抢设备）、pygame、auto（先 sounddevice）。
+
+    proximity_beep_sample_rate: int = 44100
+    # sounddevice 播放采样率（赫兹）。
+
+    proximity_beep_pause_while_pygame_music_busy: bool = False
+    # 为 True 时，MiMo TTS 使用 pygame.music 期间会几乎一直静音滴滴（异步队列长时尤其明显）。
+    # 默认 False：允许与 TTS 同时出声；若仍嫌叠音，可改 True 并配合调低 TTS 或缩短播报。
+
+    proximity_beep_pause_while_guidance_suppress: bool = True
+    # 为 True 时，在 guidance_suppress_after_voice 等抑制窗口内不播滴滴。
+
+    proximity_beep_suppress_after_guidance_sec: float = 0.9
+    # 每次播报一条移动引导 TTS 后的静音窗口（秒）；过长会导致几乎听不到滴滴。
 
     # ---- 录音参数设置 ----
 
@@ -612,10 +725,10 @@ class SystemConfig:
     # 格式: 使用英文名词短语，如 "a cup", "a bottle", "a person"。
     # 注意: 此值可在运行时被 core/system.py 动态修改。
 
-    camera_id: int = 1
+    camera_id: int = 0
     # 摄像头设备 ID。
     # 效果: 对应系统摄像头编号，0 为默认摄像头，多摄像头时可设为 1、2 等。
-    # 推荐: 单摄像头环境保持默认 0。
+    # 推荐: 单摄像头环境保持 0；外接多个摄像头时再改为 1、2…
 
     camera_width: int = 848
     # 摄像头采集画面宽度（像素）。

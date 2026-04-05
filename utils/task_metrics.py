@@ -479,6 +479,7 @@ class TaskMetricsCollector:
             "switch_target": "切换目标",
             "lost_target": "目标丢失",
             "user_voice_exit": "语音退出",
+            "user_exit": "用户关闭窗口或主动退出",
             "error": "异常结束",
         }
         return mapping.get(end_reason, end_reason or "未知")

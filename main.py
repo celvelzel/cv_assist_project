@@ -5,6 +5,10 @@ CV 视觉辅助系统 - 主入口
 
 import sys
 import os
+import faulthandler
+
+# 原生扩展(C++/CUDA 等)崩溃时尽量在 stderr 打出 Python 栈，便于排查「突然卡退无日志」
+faulthandler.enable()
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONUTF8", "1")
