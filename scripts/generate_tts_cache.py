@@ -65,7 +65,10 @@ def main():
         print("Force mode: existing files will be overwritten")
     print()
     
-    total, generated, skipped, failed = generate_cache_files(mimo_tts, args.force)
+    try:
+        total, generated, skipped, failed = generate_cache_files(mimo_tts, args.force)
+    finally:
+        mimo_tts.close()
     
     print()
     print("=" * 50)
