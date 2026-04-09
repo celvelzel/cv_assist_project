@@ -52,7 +52,7 @@ TTS_CACHE_MAP = {
     '抓取! 闭合手掌': 'grab_close_hand',
     '已抓住!': 'grabbed'
 }
-LOCAL_AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_audio")
+LOCAL_AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tts_cache")
 
 
 class MiMoTTS(BaseTTS):
@@ -163,37 +163,43 @@ class MiMoTTS(BaseTTS):
             filename = TTS_CACHE_MAP[text]
             cache_path = os.path.join(LOCAL_AUDIO_DIR, f"{filename}.wav")
             if os.path.exists(cache_path):
-                logger.debug(f"MiMo TTS 命中本地缓存: '{text}' -> {cache_path}")
-                with open(cache_path, 'rb') as f:
-                    return f.read()
+                try:
+                    logger.debug(f"MiMo TTS 命中本地缓存: '{text}' -> {cache_path}")
+                    with open(cache_path, 'rb') as f:
+                        return f.read()
+                except OSError as e:
+                    logger.warning(f"MiMo TTS 缓存文件读取失败，回退到 API: {cache_path} ({e})")
 
         logger.debug(f"MiMo TTS API合成: '{text}'")
-
-        completion = self.client.chat.completions.create(
-            model="mimo-v2-tts",
-            messages=[
-                {
-                    "role": "user",
-                    "content": ""
-                },
-                {
-                    "role": "assistant",
-                    "content": text
+        try:
+            completion = self.client.chat.completions.create(
+                model="mimo-v2-tts",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": ""
+                    },
+                    {
+                        "role": "assistant",
+                        "content": text
+                    }
+                ],
+                audio={
+                    "format": "wav",
+                    "voice": self.voice
                 }
-            ],
-            audio={
-                "format": "wav",
-                "voice": self.voice
-            }
-        )
+            )
 
-        message = completion.choices[0].message
-        audio = getattr(message, "audio", None)
-        if audio is None or not getattr(audio, "data", None):
-            raise RuntimeError("MiMo TTS 返回结果缺少音频数据")
+            message = completion.choices[0].message
+            audio = getattr(message, "audio", None)
+            if audio is None or not getattr(audio, "data", None):
+                raise RuntimeError("MiMo TTS 返回结果缺少音频数据")
 
-        audio_data = base64.b64decode(audio.data)
-        return audio_data
+            audio_data = base64.b64decode(audio.data)
+            return audio_data
+        except Exception as e:
+            logger.error(f"MiMo TTS API 调用失败: {e}", exc_info=True)
+            raise
 
     def _play_audio(self, audio_bytes: bytes):
         """
