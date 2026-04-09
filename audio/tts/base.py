@@ -41,6 +41,21 @@ class BaseTTS(ABC):
         """
         self.speak(instruction)
 
+    def speak_lifecycle(self, text: str):
+        """
+        播报任务生命周期提示（开始/结束/完成）。
+
+        与 speak() 的区别：
+        - 停止当前正在播放的内容并清空队列
+        - 阻塞等待本条完整播完后返回
+        - 不可被其他普通播报打断
+
+        默认回退到 speak(block=True)，子类可覆盖以实现更严格的抢占。
+        """
+        self.stop()
+        self.clear_queue()
+        self.speak(text, block=True)
+
     def stop(self):
         """停止当前播放（默认无操作）"""
 

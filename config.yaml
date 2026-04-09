@@ -1,8 +1,12 @@
-# CV 视觉辅助系统配置
-# ===================
-# 通过 --config <profile> 选择预设，预设值会覆盖下方基础配置。
+# CV 视觉辅助系统 - Profile 预设配置
+# ===================================
+# 注意: 所有配置的默认值已在 config.py 中定义。
+# 本文件仅用于定义不同运行模式（profile）的覆盖值。
+# 使用方式: python main.py --config <profile_name>
+# 可用 profile: fast, no-voice
+# balanced 模式使用 config.py 中的全部默认值，无需在此定义。
 
-# ---- Profile 预设（仅列出与 base 不同的字段） ----
+# ---- Profile 预设（仅列出与 config.py 默认值不同的字段） ----
 profiles:
   fast: # 性能优先，适合低配设备
     model:
@@ -11,104 +15,17 @@ profiles:
       skip_frames_detection: 3
       skip_frames_depth: 3
 
-  voice: # ASR + TTS 全语音交互
+  no-voice: # 仅视觉处理，无语音交互
     audio:
-      enable_asr: true
-      enable_tts: true
-      whisper_model: base
-      tts_rate: 180
+      enable_asr: false
+      enable_tts: false
 
-  tts: # 仅 TTS 语音播报（默认离线 pyttsx3）
-    audio:
-      enable_tts: true
-      tts_rate: 180
+  light: # 极速模式：大幅降低检测频率，适合 CPU 运行
+    model:
+      owlvit_input_size: [256, 256]
+      midas_model: MiDaS_small
+    optimization:
+      skip_frames_detection: 5
+      skip_frames_depth: 5
 
-  mimo-tts: # MiMo 云端 TTS
-    audio:
-      enable_asr: true
-      enable_tts: true
-      whisper_model: medium # tiny / base / small / medium / large
-      tts_provider: mimo
-
-# balanced 无额外 override，直接使用下方基础配置。
-
-# ---- 基础配置（所有 profile 共享） ----
-
-target_queries:
-  - "a cup"
-  - "a bottle"
-
-camera:
-  width: 640
-  height: 480
-
-model:
-  owlvit_model: "google/owlvit-base-patch32"
-  owlvit_input_size: [384, 384]
-  owlvit_confidence_threshold: 0.1
-  midas_model: "MiDaS_small"
-  midas_scale: 0.5
-  hand_max_num: 1
-  hand_min_confidence: 0.5
-
-optimization:
-  use_fp16: true
-  skip_frames_detection: 2
-  skip_frames_depth: 2
-  device: "auto" # auto / cuda / cpu
-
-guidance:
-  horizontal_threshold: 30
-  vertical_threshold: 30
-  depth_threshold: 0.15
-  horizontal_threshold_enter: 24
-  horizontal_threshold_exit: 36
-  vertical_threshold_enter: 24
-  vertical_threshold_exit: 36
-  depth_threshold_enter: 0.12
-  depth_threshold_exit: 0.18
-  grasp_stable_frames: 8
-  grasp_release_frames: 3
-
-audio:
-  enable_asr: false
-  whisper_model: "medium" # tiny / base / small / medium / large
-  asr_language: "zh,en" # bilingual zh/en / auto / zh / en
-  enable_tts: false
-  tts_provider: "pyttsx3"
-  tts_rate: 150
-  tts_volume: 1.0
-  tts_async: true
-  tts_instruction_interval_sec: 3.0
-  tts_grab_repeat_sec: 3.0
-  tts_max_queue_size: 1
-  tts_drop_stale: true
-  tts_state_change_bypass: true
-  mimo_voice: "mimo_default"
-  record_sample_rate: 16000
-  record_duration: 5.0
-  auto_detect_silence: true
-  silence_threshold: 0.01
-  silence_duration: 1.0
-  voice_feedback_after_recording: true
-  voice_feedback_on_target_confirm: true
-  target_found_feedback_enabled: true
-  target_found_frame_threshold: 8
-  target_missing_feedback_enabled: true
-  target_missing_frame_threshold: 45
-  guidance_suppress_after_voice_sec: 1.5
-
-llm_vision:
-  enable_llm_parsing: true
-  poe_model: "deepseek-v3.2"
-  poe_timeout_sec: 5.0
-  max_frames_for_vision: 4
-  api_retry_count: 1
-
-logging:
-  log_dir: "logs"
-  log_level: "INFO"
-  log_to_file: true
-  log_to_console: true
-  enable_fps_stats: true
-  fps_window_size: 30
+# balanced 无额外 override，直接使用 config.py 中的全部默认值。

@@ -11,8 +11,8 @@
 - 支持多种命令格式（如"找到杯子"、"where is the cup"）
 
 ### 🔊 TTS (文本转语音)
-- 使用 pyttsx3 实现跨平台语音合成
-- 完全离线，无需网络
+- 支持两种后端：pyttsx3（离线）和 MiMo 云端（高质量）
+- 默认使用 MiMo 云端 TTS（需 API Key），可切换为 pyttsx3 离线模式
 - 自动播放引导指令（向左、向右、向上等）
 - 可调节语速和音量
 
@@ -79,11 +79,12 @@ python main.py --config tts
 ```python
 @dataclass
 class AudioConfig:
-    enable_asr: bool = True   # 启用语音识别
-    enable_tts: bool = True   # 启用文本转语音
-    whisper_model: str = "base"  # Whisper 模型大小
-    asr_language: str = "zh"     # 识别语言
-    tts_rate: int = 150          # 语速
+    enable_asr: bool = True        # 启用语音识别
+    enable_tts: bool = True        # 启用文本转语音
+    whisper_model: str = "base"    # Whisper 模型大小
+    asr_language: str = "zh,en"    # 识别语言
+    tts_provider: str = "mimo"     # TTS 提供商
+    tts_rate: int = 180            # 语速
 ```
 
 然后正常运行：
@@ -131,7 +132,7 @@ python main.py
 
 ### ASR 配置
 
-- `enable_asr`: 是否启用语音识别（默认 False）
+- `enable_asr`: 是否启用语音识别（默认 **True**）
 - `whisper_model`: Whisper 模型大小
   - `tiny`: 最快，准确率较低 (~39M)
   - `base`: 速度快，准确率一般 (~74M) - **推荐**
@@ -142,8 +143,11 @@ python main.py
 
 ### TTS 配置
 
-- `enable_tts`: 是否启用语音输出（默认 False）
-- `tts_rate`: 语速（默认 150）
+- `enable_tts`: 是否启用语音输出（默认 **True**）
+- `tts_provider`: TTS 提供商（默认 `"mimo"`）
+  - `"pyttsx3"`: 离线，使用系统语音引擎
+  - `"mimo"`: 云端，需 API Key 但音质更好
+- `tts_rate`: 语速（默认 **180**）
   - 范围：100-300
   - 推荐：150-200
 - `tts_volume`: 音量（默认 1.0）
@@ -222,10 +226,10 @@ Whisper 模型首次运行时会自动下载。如果下载慢：
 ### 单独使用 TTS
 
 ```python
-from audio.tts import TTSEngine
+from audio.tts.base import TTSEngine
 
 # 初始化 TTS
-tts = TTSEngine(rate=150, volume=1.0)
+tts = TTSEngine(rate=180, volume=1.0)
 
 # 播放文本
 tts.speak("你好，欢迎使用视觉辅助系统")
@@ -241,7 +245,7 @@ from audio.asr import ASREngine
 from audio.audio_utils import AudioRecorder
 
 # 初始化 ASR
-asr = ASREngine(model_name="base", language="zh")
+asr = ASREngine(model_name="base", language="zh,en")
 
 # 录制音频
 recorder = AudioRecorder(sample_rate=16000)

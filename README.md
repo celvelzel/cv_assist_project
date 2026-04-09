@@ -58,7 +58,7 @@ A real-time visual assistance system designed to help visually impaired users lo
 
 ### Technical Pipeline
 
-1. **Object Detection** — OWL-ViT (`google/owlvit-base-patch32`) performs open-vocabulary, zero-shot detection from natural-language queries (e.g. "a cup").
+1. **Object Detection** — OWL-ViT v2 (`google/owlv2-base-patch16-ensemble`) performs open-vocabulary, zero-shot detection from natural-language queries (e.g. "a cup").
 2. **Depth Estimation** — MiDaS (`MiDaS_small`) generates a monocular depth map from a single RGB frame. Depth values are sampled at detection centers to estimate object distance.
 3. **Hand Tracking** — MediaPipe provides 21-keypoint hand landmarks and gesture recognition (open / closed / pointing).
 4. **Spatial Guidance** — The `GuidanceController` computes directional instructions ("move left", "move closer") using hysteresis thresholds to prevent jitter.
@@ -72,7 +72,7 @@ A real-time visual assistance system designed to help visually impaired users lo
 - **Real-time depth estimation** — monocular depth via MiDaS for distance-aware guidance
 - **Hand tracking with gesture recognition** — detects open, closed, and pointing gestures
 - **Voice control** — speak to set the target object (Chinese & English supported)
-- **LLM-assisted voice recognition** — ✨ NEW! Uses Poe API + deepseek LLM with visual context to correct speech errors and improve accuracy
+- **LLM-assisted voice recognition** — Uses Poe API + deepseek LLM with visual context to correct speech errors and improve accuracy
 - **Speech guidance** — audio instructions guide the user's hand toward the target
 - **Hysteresis-based guidance** — prevents oscillation at alignment boundaries
 - **Configurable profiles** — fast / balanced / voice / tts / mimo-tts presets
@@ -163,11 +163,9 @@ Pass `--config <profile>` to select a preset. Profiles are defined in the `profi
 
 | Profile    | ASR | TTS | TTS Provider | Use Case                       |
 | ---------- | --- | --- | ------------ | ------------------------------ |
+| `balanced` | On  | On  | mimo         | Default, full voice (default)  |
 | `fast`     | Off | Off | —            | Low-resource / testing         |
-| `balanced` | Off | Off | —            | Default, no audio              |
-| `voice`    | On  | On  | pyttsx3      | Full voice interaction         |
-| `tts`      | Off | On  | pyttsx3      | Speech guidance only (default) |
-| `mimo-tts` | Off | On  | MiMo cloud   | Higher-quality cloud TTS       |
+| `no-voice` | Off | Off | —            | Visual processing only         |
 
 > `balanced` has no overrides — it uses the base configuration directly.
 
@@ -203,7 +201,7 @@ camera:
   height: 480
 
 model:
-  owlvit_model: google/owlvit-base-patch32
+  owlvit_model: google/owlv2-base-patch16-ensemble
   owlvit_input_size: [384, 384]
   midas_model: MiDaS_small
   hand_max_num: 1
@@ -215,9 +213,10 @@ optimization:
   device: auto
 
 audio:
-  enable_tts: false
+  enable_tts: true
   tts_provider: mimo
-  tts_rate: 150
+  tts_rate: 180
+  tts_instruction_interval_sec: 2.0
   # ...
 ```
 
@@ -307,7 +306,7 @@ For detailed audio documentation, see [audio/README.md](audio/README.md).
 
 ## LLM-Assisted Voice Recognition with Vision
 
-**NEW FEATURE**: The system now integrates with Poe API (using deepseek-v3.2 LLM) to enhance voice command recognition using visual context from camera frames. This significantly improves accuracy for users with unclear speech, accents, or background noise.
+The system integrates with Poe API (using deepseek-v3.2 LLM) to enhance voice command recognition using visual context from camera frames. This significantly improves accuracy for users with unclear speech, accents, or background noise.
 
 ### How It Works
 
@@ -531,7 +530,7 @@ cv_assist_project/
 
 ### 技术管线
 
-1. **目标检测** — OWL-ViT（`google/owlvit-base-patch32`）基于自然语言查询进行开放词汇零样本检测（如 "a cup"）。
+1. **目标检测** — OWL-ViT v2（`google/owlv2-base-patch16-ensemble`）基于自然语言查询进行开放词汇零样本检测（如 "a cup"）。
 2. **深度估计** — MiDaS（`MiDaS_small`）从单张 RGB 图像生成深度图，在检测框中心采样距离值。
 3. **手部追踪** — MediaPipe 提供 21 个手部关键点及手势识别（张开 / 握拳 / 指向）。
 4. **空间引导** — `GuidanceController` 计算方向指令（"向左移"、"靠近"），使用滞回阈值防止边界抖动。
@@ -636,11 +635,9 @@ python tests/test_all.py
 
 | 预设       | ASR | TTS | TTS 提供商 | 适用场景                   |
 | ---------- | --- | --- | ---------- | -------------------------- |
+| `balanced` | 开  | 开  | mimo       | 默认，完整语音（默认）     |
 | `fast`     | 关  | 关  | —          | 低资源环境 / 测试          |
-| `balanced` | 关  | 关  | —          | 默认，无语音               |
-| `voice`    | 开  | 开  | pyttsx3    | 完整语音交互               |
-| `tts`      | 关  | 开  | pyttsx3    | 仅语音播报（部署脚本默认） |
-| `mimo-tts` | 关  | 开  | MiMo 云端  | 更高质量的云端 TTS         |
+| `no-voice` | 关  | 关  | —          | 仅视觉处理                 |
 
 > `balanced` 无额外 override，直接使用基础配置。
 
@@ -676,7 +673,7 @@ camera:
   height: 480
 
 model:
-  owlvit_model: google/owlvit-base-patch32
+  owlvit_model: google/owlv2-base-patch16-ensemble
   owlvit_input_size: [384, 384]
   midas_model: MiDaS_small
   hand_max_num: 1
@@ -688,9 +685,10 @@ optimization:
   device: auto
 
 audio:
-  enable_tts: false
+  enable_tts: true
   tts_provider: mimo
-  tts_rate: 150
+  tts_rate: 180
+  tts_instruction_interval_sec: 2.0
   # ...
 ```
 
@@ -780,7 +778,7 @@ OPENAI_API_KEY=your_openai_key_here
 
 ## LLM 增强语音识别与视觉理解
 
-**新功能**：系统现已集成 Poe API（使用 deepseek-v3.2 LLM）以增强语音命令识别准确度。LLM 可同时分析识别到的文本和摄像头中的视觉信息，大幅提高了对口音、背景噪声和不清晰语音的鲁棒性。
+系统现已集成 Poe API（使用 deepseek-v3.2 LLM）以增强语音命令识别准确度。LLM 可同时分析识别到的文本和摄像头中的视觉信息，大幅提高了对口音、背景噪声和不清晰语音的鲁棒性。
 
 ### 工作流程
 

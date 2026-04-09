@@ -181,6 +181,8 @@ class AudioRecorder:
         frames = []
         silent_frames = 0
         max_silent_frames = int(silence_duration * self.sample_rate / 1024)  # 1024 是块大小
+        # 避免「一开头全是静音」就立刻结束：须先检测到说话，之后的连续静音才视为说完
+        has_speech = False
         
         start_time = time.time()
         
@@ -209,11 +211,12 @@ class AudioRecorder:
                         silent_frames += 1
                     else:
                         silent_frames = 0
+                        has_speech = True
                     
                     # 检查停止条件
                     elapsed = time.time() - start_time
                     
-                    if silent_frames >= max_silent_frames:
+                    if silent_frames >= max_silent_frames and has_speech:
                         logger.info(f"检测到静音，停止录音 ({elapsed:.1f}s)")
                         break
                     

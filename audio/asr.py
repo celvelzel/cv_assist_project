@@ -6,6 +6,7 @@
 import torch
 import logging
 import numpy as np
+import re
 from typing import Optional
 import warnings
 
@@ -79,10 +80,15 @@ class ASREngine:
             logger.error(f"Whisper 模型加载失败: {e}")
             raise
     
+    def _build_mel(self, audio_data: np.ndarray) -> torch.Tensor:
+        """生成与当前模型匹配的 mel 频谱（自动读取模型所需的 n_mels）。"""
+        n_mels = self.model.dims.n_mels
+        audio_data = whisper.pad_or_trim(audio_data.astype(np.float32))
+        return whisper.log_mel_spectrogram(audio_data, n_mels=n_mels).to(self.model.device)
+
     def _detect_language_from_audio_array(self, audio_data: np.ndarray) -> str:
         """从音频波形中检测语言。"""
-        audio_data = whisper.pad_or_trim(audio_data.astype(np.float32))
-        mel = whisper.log_mel_spectrogram(audio_data).to(self.model.device)
+        mel = self._build_mel(audio_data)
         _, probs = self.model.detect_language(mel)
         return max(probs, key=probs.get)
 
@@ -92,8 +98,7 @@ class ASREngine:
             return self._detect_language_from_audio_array(audio_data)
 
         if self.language == "zh,en":
-            audio_data = whisper.pad_or_trim(audio_data.astype(np.float32))
-            mel = whisper.log_mel_spectrogram(audio_data).to(self.model.device)
+            mel = self._build_mel(audio_data)
             _, probs = self.model.detect_language(mel)
             zh_prob = probs.get("zh", 0.0)
             en_prob = probs.get("en", 0.0)
@@ -200,6 +205,40 @@ class ASREngine:
         except Exception as e:
             logger.error(f"音频数据转录失败: {e}")
             return {'text': '', 'language': self.language, 'error': str(e)}
+
+    def _normalize_command_text(self, text: str) -> str:
+        """标准化语音文本，便于统一做控制词与目标提取。"""
+        text = (text or "").strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        for filler in ["请帮我", "帮我", "请", "一下", "一下子", "麻烦", "我想", "我想要"]:
+            text = text.replace(filler, "")
+        return text.strip()
+
+    def _match_control_action(self, normalized_text: str) -> Optional[dict]:
+        """优先匹配退出或停止类控制动作。"""
+        control_keywords = [
+            "退出程序",
+            "停止任务",
+            "退出任务",
+            "结束任务",
+            "停止",
+            "退出",
+            "stop task",
+            "exit program",
+            "quit program",
+            "stop",
+            "quit",
+            "exit",
+        ]
+        for keyword in control_keywords:
+            if keyword in normalized_text:
+                return {
+                    "status": "ok",
+                    "action": "user_voice_exit",
+                    "target": None,
+                    "message": "正在退出程序",
+                }
+        return None
     
     def parse_command(self, text: str) -> Optional[str]:
         """
@@ -257,6 +296,56 @@ class ASREngine:
         # 如果没有明确的命令关键词，返回整个文本作为目标
         logger.warning(f"无法解析指令: '{text}'，使用全文作为目标")
         return text if text else None
+
+    def parse_voice_event(
+        self,
+        text: str,
+        has_active_task: bool,
+        frames: Optional[list] = None,
+        llm_parser=None,
+    ) -> dict:
+        """
+        解析语音结果，返回统一的动作事件对象。
+        """
+        normalized_text = self._normalize_command_text(text)
+        if not normalized_text:
+            return {
+                "status": "error",
+                "action": None,
+                "target": None,
+                "message": "没有识别到内容，请重试",
+            }
+
+        control_event = self._match_control_action(normalized_text)
+        if control_event:
+            return control_event
+
+        target = self.parse_command_with_vision(
+            text=normalized_text,
+            frames=frames,
+            llm_parser=llm_parser,
+        )
+        if not target:
+            return {
+                "status": "error",
+                "action": None,
+                "target": None,
+                "message": "抱歉，无法理解您的指令",
+            }
+
+        action = "switch_target" if has_active_task else "set_target"
+        target = target.strip()
+        message = (
+            f"原任务结束，切换至目标主体{target}"
+            if action == "switch_target"
+            else f"开始寻找目标主体{target}"
+        )
+        return {
+            "status": "ok",
+            "action": action,
+            "target": target,
+            "message": message,
+        }
     
     def parse_command_with_vision(self,
                                    text: str,

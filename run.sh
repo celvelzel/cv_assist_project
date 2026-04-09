@@ -31,18 +31,7 @@ if ! python -c "import torch, transformers, mediapipe" >/dev/null 2>&1; then
     fi
 fi
 
-# Default to tts config if user did not pass --config
-ARGS=("$@")
-HAS_CONFIG=false
-for arg in "$@"; do
-    if [ "$arg" = "--config" ]; then
-        HAS_CONFIG=true
-        break
-    fi
-done
-if [ "$HAS_CONFIG" = false ]; then
-    ARGS=(--config tts "$@")
-fi
+
 
 # Run main.py inside the virtual environment
-python -X utf8 main.py "${ARGS[@]}"
+python -X utf8 main.py 

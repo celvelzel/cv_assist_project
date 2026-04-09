@@ -10,6 +10,7 @@ import time
 import logging
 import threading
 import queue
+import uuid
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from collections import deque
@@ -22,8 +23,15 @@ from config import SystemConfig, load_config
 from detectors.owl_vit_detector import OWLViTDetector
 from detectors.hand_tracker import HandTracker
 from detectors.depth_estimator import DepthEstimator
-from core.guidance import GuidanceController, GuidanceResult
+from core.guidance import (
+    GuidanceController,
+    GuidanceResult,
+    approximate_separation_meters,
+    clock_hour_from_hand_to_target,
+    clock_hour_from_horizontal_plane,
+)
 from utils.logger import setup_logging, FPSCounter
+from utils.task_metrics import AsyncReportWriter, FrameMetrics, TaskMetricsCollector, TaskReportEnvelope
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +57,28 @@ class FrameResult:
     hands: List[Dict]                # 手部检测结果列表
     depth_map: Optional[np.ndarray]  # 深度图
     guidance: Optional[GuidanceResult]  # 引导信息
+    frame_start_ts: float            # 帧处理开始时间戳
+    frame_end_ts: float              # 帧处理结束时间戳
     total_time_ms: float             # 总处理时间(毫秒)
     detection_time_ms: float         # 目标检测时间
     hand_time_ms: float              # 手部检测时间
     depth_time_ms: float             # 深度估计时间
+    guidance_time_ms: float          # 引导计算时间
+    detection_executed: bool         # 当前帧是否执行了检测
+    depth_executed: bool             # 当前帧是否执行了深度估计
+    has_target: bool                 # 当前帧是否检测到目标
+    has_hand: bool                   # 当前帧是否检测到手
+    has_guidance: bool               # 当前帧是否生成引导
+    guidance_state: str              # 引导状态
+    ready_to_grab: bool              # 是否进入可抓取状态
+    stable_ready_frames: int         # ready 持续帧数
+    gesture: str                     # 当前手势
+    target_visible: bool             # 当前任务目标是否可见
+    target_x: float                  # 目标中心 X 坐标（像素），无目标时为 float('nan')
+    hand_near_target: bool           # 手部中心是否接近目标中心
+    hand_target_distance_px: float   # 手部中心与目标中心的像素距离
+    detections_count: int            # 检测目标数量
+    hands_count: int                 # 手部数量
 
 
 class CVAssistSystem:
@@ -128,6 +154,7 @@ class CVAssistSystem:
 
         # 运行时状态（线程与播报节流）
         self._init_runtime_states()
+        self._init_task_metrics()
         
         # 初始化 FPS 计数器
         if self.config.logging.enable_fps_stats:
@@ -136,6 +163,14 @@ class CVAssistSystem:
         else:
             self.fps_counter = None
             self.e2e_fps_counter = None
+
+        self._spatial_briefing_task_id: Optional[str] = None
+        try:
+            from audio.proximity_beep import ProximityBeepPlayer
+            self._proximity_beep = ProximityBeepPlayer()
+        except Exception as e:
+            logger.debug("近距离滴滴声模块未加载: %s", e)
+            self._proximity_beep = None
         
         logger.info("系统初始化完成")
     
@@ -202,6 +237,8 @@ class CVAssistSystem:
             depth_threshold_exit=cfg.guidance.depth_threshold_exit,
             grasp_stable_frames=cfg.guidance.grasp_stable_frames,
             grasp_release_frames=cfg.guidance.grasp_release_frames,
+            depth_instruction_first=cfg.guidance.depth_instruction_first,
+            invert_depth_guidance=cfg.guidance.invert_depth_guidance,
         )
         
         logger.info("所有组件初始化成功")
@@ -275,20 +312,59 @@ class CVAssistSystem:
         self._voice_prompt_playing = False
         self._voice_result_queue = queue.Queue()
         self._suppress_guidance_until_ts = 0.0
+        # 生命周期 TTS 专用锁：保证同时只有一条生命周期播报在执行
+        self._lifecycle_tts_lock = threading.Lock()
+        # 生命周期播报进行中标志：为 True 时屏蔽所有普通指令播报
+        self._lifecycle_speaking = False
         self._search_feedback_target = None
         self._search_feedback_state = "idle"
         self._target_found_streak = 0
         self._target_missing_streak = 0
+        self._target_missing_last_spoken_ts = 0.0  # 上次播报"未找到"的时间戳
+        self._hand_stable_streak = 0  # 手部连续出现帧数，达到阈值后才播报引导
 
         self._last_instruction = None
         self._last_instruction_state = None
         self._last_instruction_ts = 0.0
         self._last_grab_ts = 0.0
-        
+        self._last_guidance_tts_ts = 0.0
+
         # 帧缓冲，用于 LLM Vision 解析（存储最后 4 帧）
         # 在 _handle_voice_input 中使用
         self._frame_buffer = deque(maxlen=self.config.llm_vision.max_frames_for_vision)
         self._frame_buffer_lock = threading.Lock()  # 保护帧缓冲的线程安全
+
+    def _init_task_metrics(self):
+        """初始化任务监测与异步报告写入。"""
+        self.session_id = uuid.uuid4().hex
+        self.current_task = None
+        self.task_state = "idle"
+        self._task_index = 0
+        self._last_task_summary_ts = 0.0
+        self._requested_shutdown = False
+        self._pause_target_detection = False
+
+        # 任务开始确认挂起态：语音触发后等待目标稳定检测 task_start_confirm_window_sec 秒再激活
+        self._pending_task: Optional[Dict] = None  # 保存待激活的任务参数
+        self._pending_task_target_since_ts: Optional[float] = None  # 目标首次稳定出现的时间戳
+
+        self.task_metrics_collector = TaskMetricsCollector(
+            grasp_stable_frames=self.config.guidance.grasp_stable_frames,
+            ready_confirm_window_sec=self.config.logging.task_ready_confirm_window_sec,
+            lost_target_window_sec=self.config.logging.task_lost_target_window_sec,
+            catch_x_min_displacement_px=self.config.logging.catch_x_min_displacement_px,
+            catch_x_stable_frames=self.config.logging.catch_x_stable_frames,
+            catch_x_stable_max_std_px=self.config.logging.catch_x_stable_max_std_px,
+            catch_hand_near_target_px=self.config.logging.catch_hand_near_target_px,
+        )
+
+        if self.config.logging.enable_task_metrics:
+            self.report_writer = AsyncReportWriter(
+                output_dir=self.config.logging.task_metrics_dir
+            )
+            self.report_writer.start()
+        else:
+            self.report_writer = None
 
     def _reset_tts_context(self):
         """目标切换后清理播报上下文，避免旧指令残留。"""
@@ -315,9 +391,49 @@ class CVAssistSystem:
         self._suppress_guidance_temporarily()
         self.tts_engine.speak(text.strip(), block=block)
 
+    def _speak_lifecycle_message(self, text: str):
+        """播报任务生命周期提示（开始/结束/完成），在独立线程中阻塞播完，不阻塞主循环。
+
+        行为约束：
+        - 不清空队列、不打断当前正在播放的内容
+        - 播报期间延长引导抑制窗口，避免普通指令立即插入
+        - 通过 _lifecycle_tts_lock 保证同时只有一条生命周期播报在执行
+        """
+        if not self.tts_engine or not text or not text.strip():
+            return
+        cfg = self.config.audio
+        suppress_sec = max(
+            1.5,
+            float(getattr(cfg, 'guidance_suppress_after_voice_sec', 1.5))
+        )
+        # 主线程提前设置抑制窗口（预留播报时间），子线程播完后精确刷新
+        self._suppress_guidance_until_ts = max(
+            self._suppress_guidance_until_ts,
+            time.time() + suppress_sec + 10.0
+        )
+
+        text_stripped = text.strip()
+        # 主线程立即置位，让 _should_speak_guidance 在子线程合成期间就停止播报
+        self._lifecycle_speaking = True
+
+        def _worker():
+            if not self._lifecycle_tts_lock.acquire(blocking=False):
+                self._lifecycle_tts_lock.acquire()
+            try:
+                self._lifecycle_speaking = True
+                self.tts_engine.speak_lifecycle(text_stripped)
+            finally:
+                self._lifecycle_speaking = False
+                self._suppress_guidance_until_ts = 0.0
+                self._lifecycle_tts_lock.release()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _speak_serial_feedback(self, text: str, block: bool = False):
         """将搜索结果反馈串行加入 TTS 队列，不打断当前确认播报。"""
         if not self.tts_engine or not text or not text.strip():
+            return
+        if self._lifecycle_speaking:
             return
 
         self._suppress_guidance_temporarily()
@@ -343,6 +459,164 @@ class CVAssistSystem:
         self._search_feedback_state = "searching" if target else "idle"
         self._target_found_streak = 0
         self._target_missing_streak = 0
+        self._target_missing_last_spoken_ts = 0.0
+
+    def _next_task_id(self) -> str:
+        """生成会话内递增任务 ID。"""
+        self._task_index += 1
+        return f"task_{self._task_index:04d}"
+
+    def _start_task(self, target: str, voice_event: Optional[Dict] = None):
+        """将任务挂入等待确认态；目标稳定检测 task_start_confirm_window_sec 秒后由主循环激活。"""
+        target = (target or "").strip()
+        task_id = self._next_task_id()
+        self._pending_task = {
+            "task_id": task_id,
+            "target_query": target,
+            "voice_event": voice_event,
+        }
+        self._pending_task_target_since_ts = None
+        self.task_state = "confirming"
+        logger.info("任务进入确认等待: task_id=%s target=%s 需持续检测 %.1f 秒",
+                    task_id, target, self.config.logging.task_start_confirm_window_sec)
+
+    def _activate_pending_task(self):
+        """确认时间窗口满足后真正激活任务。"""
+        if not self._pending_task:
+            return
+        pending = self._pending_task
+        self._pending_task = None
+        self._pending_task_target_since_ts = None
+
+        now = time.time()
+        target = pending["target_query"]
+        task_id = pending["task_id"]
+        voice_event = pending.get("voice_event")
+
+        self.current_task = {
+            "task_id": task_id,
+            "target_query": target,
+            "start_time": now,
+        }
+        self.task_state = "running"
+        self._last_task_summary_ts = 0.0
+        self.task_metrics_collector.start_task(
+            task_id=task_id,
+            target_query=target,
+            start_time=now,
+            session_id=self.session_id,
+        )
+        if voice_event:
+            self.task_metrics_collector.record_voice_metrics(
+                voice_total_time_ms=voice_event.get("voice_total_time_ms", 0.0),
+                voice_asr_time_ms=voice_event.get("voice_asr_time_ms", 0.0),
+                raw_text=voice_event.get("raw_text", ""),
+            )
+        logger.info("任务正式激活: task_id=%s target=%s", task_id, target)
+        if self._proximity_beep:
+            self._proximity_beep.reset_cooldown()
+        self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
+
+    def _start_task_now(self, target: str):
+        """立即激活任务（用于预设目标自动启动）。"""
+        target = (target or "").strip()
+        if not target:
+            return
+
+        task_id = self._next_task_id()
+        now = time.time()
+        self.current_task = {
+            "task_id": task_id,
+            "target_query": target,
+            "start_time": now,
+        }
+        self.task_state = "running"
+        self._last_task_summary_ts = 0.0
+        self.task_metrics_collector.start_task(
+            task_id=task_id,
+            target_query=target,
+            start_time=now,
+            session_id=self.session_id,
+        )
+        logger.info("预设目标任务已自动激活: task_id=%s target=%s", task_id, target)
+        if self._proximity_beep:
+            self._proximity_beep.reset_cooldown()
+
+    def _update_pending_task_confirmation(self, detections: List[Dict], now: float):
+        """主循环每帧调用：根据当前检测结果推进任务开始确认进度。"""
+        if not self._pending_task:
+            return
+        confirm_window = self.config.logging.task_start_confirm_window_sec
+        if detections:
+            if self._pending_task_target_since_ts is None:
+                self._pending_task_target_since_ts = now
+            elif now - self._pending_task_target_since_ts >= confirm_window:
+                self._activate_pending_task()
+        else:
+            # 目标消失，重置确认计时
+            if self._pending_task_target_since_ts is not None:
+                logger.debug("任务确认期间目标消失，重置计时: task_id=%s",
+                             self._pending_task["task_id"])
+            self._pending_task_target_since_ts = None
+
+    def _enqueue_task_report(self, report_dict: Dict, task_id: str, created_at: float) -> Optional[str]:
+        """将冻结后的任务报告入队后台写盘。返回写入路径，若无 writer 则 None。"""
+        if not self.report_writer:
+            return None
+        output_path = self.report_writer.build_output_path(task_id, created_at=created_at)
+        envelope = TaskReportEnvelope(
+            task_id=task_id,
+            output_path=output_path,
+            report_dict=report_dict,
+            created_at=created_at,
+        )
+        self.report_writer.enqueue(envelope)
+        return output_path
+
+    def _finish_current_task(self, end_reason: str, error_message: str = "") -> Optional[Dict]:
+        """结束当前任务并提交冻结快照。同时丢弃尚未激活的挂起任务。"""
+        self._pending_task = None
+        self._pending_task_target_since_ts = None
+        if not self.current_task:
+            self.task_state = "idle"
+            return None
+
+        if self._proximity_beep:
+            self._proximity_beep.set_continuous_eligible(False)
+
+        now = time.time()
+        task_id = self.current_task["task_id"]
+        target_query = self.current_task["target_query"]
+        should_emit_report = self.task_metrics_collector.should_emit_report()
+        report_dict = self.task_metrics_collector.finish_task(
+            end_reason=end_reason,
+            end_time=now,
+            error_message=error_message,
+        )
+        report_path = ""
+        if should_emit_report:
+            report_path = self._enqueue_task_report(report_dict, task_id=task_id, created_at=now) or ""
+        else:
+            logger.info("任务未检测到目标，跳过报告写入: task_id=%s", task_id)
+
+        if end_reason == "success":
+            # 任务成功后暂停目标检测，直到下一次语音设置新目标
+            self._pause_target_detection = True
+            self.cached_detections = []
+            console_report = self.task_metrics_collector.build_success_console_report(report_path)
+            logger.info("\n%s", console_report)
+
+        self.current_task = None
+        self.task_state = "idle"
+
+        # 对于预设目标，若任务因丢失结束，则自动回到搜索/确认状态，避免系统停住
+        if end_reason == "lost_target" and target_query in self.config.target_queries:
+            self._pause_target_detection = False
+            self.cached_detections = []
+            self._begin_target_search_feedback(target_query)
+            self._start_task(target_query)
+
+        return report_dict
 
     def _update_target_search_feedback(self, detections: List[Dict]):
         """基于当前目标的检测结果播报找到/未找到反馈。"""
@@ -359,7 +633,10 @@ class CVAssistSystem:
                 return
             if self._search_feedback_state != "found":
                 self._search_feedback_state = "found"
-                if self.tts_engine and getattr(cfg, 'target_found_feedback_enabled', True):
+                # 任务处于确认等待阶段时，"已找到"与"开始执行"合并
+                # 由 _activate_pending_task 统一播报，此处不单独播
+                in_confirming = self._pending_task is not None
+                if not in_confirming and self.tts_engine and getattr(cfg, 'target_found_feedback_enabled', True):
                     self._speak_serial_feedback(f"已找到目标主体{target}")
             return
 
@@ -369,10 +646,24 @@ class CVAssistSystem:
         if self._target_missing_streak < threshold:
             return
 
-        if self._search_feedback_state != "missing":
+        now = time.time()
+        repeat_interval = max(
+            5.0,
+            float(getattr(cfg, 'target_missing_repeat_interval_sec', 30.0))
+        )
+        # 任务进行中只播报一次；未进入任务时按间隔重复播报
+        in_task = self.current_task is not None
+        first_time = self._search_feedback_state != "missing"
+        due_for_repeat = (
+            not in_task
+            and now - self._target_missing_last_spoken_ts >= repeat_interval
+        )
+
+        if first_time or due_for_repeat:
             self._search_feedback_state = "missing"
             if self.tts_engine and getattr(cfg, 'target_missing_feedback_enabled', True):
                 self._speak_serial_feedback(f"暂未找到目标主体{target}，请调整位置后重试")
+                self._target_missing_last_spoken_ts = now
 
     def _guidance_state(self, guidance: GuidanceResult) -> str:
         """提取引导语义状态。"""
@@ -383,6 +674,8 @@ class CVAssistSystem:
         cfg = self.config.audio
         now = time.time()
         if self._voice_in_progress or self._voice_prompt_playing:
+            return False
+        if self._lifecycle_speaking:
             return False
         if now < self._suppress_guidance_until_ts:
             return False
@@ -401,6 +694,157 @@ class CVAssistSystem:
 
         return (now - self._last_instruction_ts) >= cfg.tts_instruction_interval_sec
 
+    def _try_spatial_briefing(self, result: FrameResult, hand_stable: bool) -> None:
+        """任务开始后首次：播报目标相对手的钟点方向与约略距离，再进入常规定向引导。"""
+        gcfg = self.config.guidance
+        if not getattr(gcfg, "enable_spatial_briefing", True):
+            return
+        if not self.current_task or not self.tts_engine:
+            return
+        if self._voice_in_progress or self._voice_prompt_playing:
+            return
+        tid = self.current_task["task_id"]
+        if self._spatial_briefing_task_id == tid:
+            return
+        if not hand_stable or not result.has_guidance or not result.guidance:
+            return
+        g = result.guidance
+        mode = str(getattr(gcfg, "clock_mode", "horizontal_plane") or "horizontal_plane").strip().lower()
+        if mode == "image_plane":
+            hour = clock_hour_from_hand_to_target(
+                g.dx,
+                g.dy,
+                flip_horizontal=bool(getattr(gcfg, "clock_flip_horizontal", False)),
+            )
+        else:
+            hour = clock_hour_from_horizontal_plane(
+                g.dx,
+                g.depth_diff,
+                flip_horizontal=bool(getattr(gcfg, "clock_flip_horizontal", False)),
+                depth_scale=float(getattr(gcfg, "clock_horizontal_depth_scale", 450.0)),
+                depth_axis_sign=float(getattr(gcfg, "clock_horizontal_depth_axis_sign", 1.0)),
+            )
+        meters = approximate_separation_meters(
+            g.dx,
+            g.dy,
+            g.depth_diff,
+            gcfg.spatial_briefing_distance_min_m,
+            gcfg.spatial_briefing_distance_max_m,
+            gcfg.spatial_briefing_ref_diagonal_px,
+            px_weight=float(getattr(gcfg, "spatial_briefing_px_weight", 0.68)),
+            depth_weight=float(getattr(gcfg, "spatial_briefing_depth_weight", 0.32)),
+            depth_span=float(getattr(gcfg, "spatial_briefing_depth_span", 0.52)),
+            distance_gamma=float(getattr(gcfg, "spatial_briefing_distance_gamma", 1.12)),
+        )
+        text = (
+            f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
+            f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
+        )
+        self._speak_priority_message(text)
+        self._spatial_briefing_task_id = tid
+
+    def _proximity_density_t(self, distance_px: float, depth_diff: float) -> float:
+        """0=手与目标在画面上很近且深度差小（滴滴最密），1=远或未对准深度（滴滴最疏）。"""
+        acfg = self.config.audio
+        far_px = max(1.0, float(acfg.proximity_beep_far_px))
+        near_px = max(0.0, min(float(acfg.proximity_beep_near_px), far_px - 1.0))
+        d = float(distance_px)
+        span = far_px - near_px
+        if span <= 0:
+            t_geom = 0.0
+        else:
+            t_geom = max(0.0, min(1.0, (d - near_px) / span))
+        if getattr(acfg, "proximity_beep_use_depth_in_density", True):
+            depth_span = max(1e-6, float(getattr(acfg, "proximity_beep_depth_diff_span", 0.22)))
+            t_depth = min(1.0, abs(float(depth_diff)) / depth_span)
+            return max(t_geom, t_depth)
+        return t_geom
+
+    def _pygame_music_busy(self) -> bool:
+        try:
+            import pygame
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _update_proximity_beep(self, result: FrameResult, now: float) -> None:
+        """任务开始若干秒后，按手与目标接近程度播放滴滴声（连续模式下疏密随 density_t 变化）。"""
+        acfg = self.config.audio
+        player = getattr(self, "_proximity_beep", None)
+        if player is None:
+            return
+        if not getattr(acfg, "proximity_beep_enabled", False):
+            player.set_continuous_eligible(False)
+            return
+        blocked = (
+            self._voice_in_progress
+            or self._voice_prompt_playing
+            or self._lifecycle_speaking
+        )
+        if blocked or not self.current_task:
+            player.set_continuous_eligible(False)
+            return
+        if getattr(acfg, "proximity_beep_pause_while_guidance_suppress", True):
+            if now < float(self._suppress_guidance_until_ts):
+                player.set_continuous_eligible(False)
+                return
+        if getattr(acfg, "proximity_beep_pause_while_pygame_music_busy", True):
+            if self._pygame_music_busy():
+                player.set_continuous_eligible(False)
+                return
+        sup_g = float(getattr(acfg, "proximity_beep_suppress_after_guidance_sec", 0.0) or 0.0)
+        if sup_g > 0.0 and (now - float(self._last_guidance_tts_ts)) < sup_g:
+            player.set_continuous_eligible(False)
+            return
+        if not result.has_hand or not result.has_guidance or not result.guidance:
+            player.set_continuous_eligible(False)
+            return
+        if acfg.proximity_beep_stop_when_ready and result.guidance.ready_to_grab:
+            player.set_continuous_eligible(False)
+            return
+        dpx = result.hand_target_distance_px
+        if dpx != dpx:  # NaN
+            player.set_continuous_eligible(False)
+            return
+
+        density_t = self._proximity_density_t(dpx, result.guidance.depth_diff)
+
+        if getattr(acfg, "proximity_beep_continuous", True):
+            player.update_continuous(
+                now=now,
+                density_t=density_t,
+                start_delay_sec=float(acfg.proximity_beep_start_delay_sec),
+                task_start_ts=float(self.current_task["start_time"]),
+                frequency_hz=int(acfg.proximity_beep_frequency_hz),
+                duration_ms=int(acfg.proximity_beep_duration_ms),
+                gap_min_ms=float(acfg.proximity_beep_continuous_gap_min_ms),
+                gap_max_ms=float(acfg.proximity_beep_continuous_gap_max_ms),
+                chunk_pulses=int(acfg.proximity_beep_continuous_chunk_pulses),
+                sample_rate=int(getattr(acfg, "proximity_beep_sample_rate", 44100) or 44100),
+                backend=str(getattr(acfg, "proximity_beep_backend", "sounddevice") or "sounddevice"),
+                volume=float(getattr(acfg, "proximity_beep_volume", 0.58) or 0.58),
+            )
+            return
+
+        player.set_continuous_eligible(False)
+        player.maybe_beep(
+            now,
+            dpx,
+            enabled=True,
+            start_delay_sec=float(acfg.proximity_beep_start_delay_sec),
+            task_start_ts=float(self.current_task["start_time"]),
+            min_interval=float(acfg.proximity_beep_min_interval_sec),
+            max_interval=float(acfg.proximity_beep_max_interval_sec),
+            far_px=float(acfg.proximity_beep_far_px),
+            near_px=float(acfg.proximity_beep_near_px),
+            frequency_hz=int(acfg.proximity_beep_frequency_hz),
+            duration_ms=int(acfg.proximity_beep_duration_ms),
+            backend=str(getattr(acfg, "proximity_beep_backend", "sounddevice") or "sounddevice"),
+            sample_rate=int(getattr(acfg, "proximity_beep_sample_rate", 44100) or 44100),
+        )
+
     def _speak_guidance(self, guidance: GuidanceResult):
         """播放当前引导并更新节流状态。"""
         if not self.tts_engine:
@@ -409,6 +853,7 @@ class CVAssistSystem:
         state = self._guidance_state(guidance)
         now = time.time()
         self.tts_engine.speak_instruction(guidance.instruction)
+        self._last_guidance_tts_ts = now
         self._last_instruction = guidance.instruction
         self._last_instruction_state = state
         self._last_instruction_ts = now
@@ -446,21 +891,51 @@ class CVAssistSystem:
                 break
 
             status = result.get('status')
-            if status == 'ok' and result.get('target'):
-                target = result['target']
-                self.config.target_queries = [target]
-                self.cached_detections = []
-                self._reset_tts_context()
-                self._begin_target_search_feedback(target)
-                logger.info(f"检测目标已更新为: {target}")
-                if self.tts_engine and getattr(self.config.audio, 'voice_feedback_on_target_confirm', True):
-                    self._speak_priority_message(f"开始寻找目标主体{target}")
-            else:
-                message = result.get('message')
+            action = result.get('action')
+            target = (result.get('target') or '').strip()
+            message = result.get('message')
+
+            if status != 'ok':
                 if message:
                     logger.warning(message)
                     if self.tts_engine:
                         self._speak_priority_message(message)
+                continue
+
+            if action == 'user_voice_exit':
+                logger.info("收到语音退出指令")
+                if self.current_task:
+                    self._speak_lifecycle_message(
+                        f"任务终止，语音退出{self.current_task['target_query']}"
+                    )
+                    self._finish_current_task('user_voice_exit')
+                elif message and self.tts_engine:
+                    self._speak_lifecycle_message(message)
+                self._requested_shutdown = True
+                self._begin_target_search_feedback("")
+                continue
+
+            if action not in ('set_target', 'switch_target') or not target:
+                if message:
+                    logger.warning(message)
+                continue
+
+            if action == 'switch_target' and self.current_task:
+                old_target = self.current_task['target_query']
+                self._speak_lifecycle_message(f"切换目标，停止{old_target}")
+                self._finish_current_task('switch_target')
+
+            self.config.target_queries = [target]
+            self._pause_target_detection = False
+            self.cached_detections = []
+            self._reset_tts_context()
+            self._begin_target_search_feedback(target)
+            self._start_task(target, voice_event=result)
+            logger.info(f"检测目标已更新为: {target}")
+
+            if self.tts_engine and getattr(self.config.audio, 'voice_feedback_on_target_confirm', True):
+                confirm_message = message or f"开始寻找{target}"
+                self._speak_lifecycle_message(confirm_message)
     
     def process_frame(self, frame: np.ndarray,
                       queries: Optional[List[str]] = None) -> FrameResult:
@@ -477,25 +952,34 @@ class CVAssistSystem:
         返回:
             FrameResult 对象，包含所有处理结果和耗时信息
         """
-        start = time.perf_counter()
+        perf_start = time.perf_counter()
+        frame_start_ts = time.time()
         
         if queries is None:
             queries = self.config.target_queries
         
         self.frame_count += 1
         
-        det_time = 0
-        hand_time = 0
-        depth_time = 0
+        det_time = 0.0
+        hand_time = 0.0
+        depth_time = 0.0
+        guidance_time = 0.0
+        detection_executed = False
+        depth_executed = False
         
         # 执行目标检测（按配置的跳帧率）
         skip_det = self.config.optimization.skip_frames_detection
         # 只有当 skip_det=0 或当前帧数满足跳帧条件时才执行检测，否则使用缓存结果
-        if skip_det == 0 or self.frame_count % (skip_det + 1) == 0:
-            t0 = time.perf_counter()
-            self.cached_detections = self.detector.detect(frame, queries)
-            det_time = (time.perf_counter() - t0) * 1000  # 转换为毫秒
-        detections = self.cached_detections  # 使用缓存的检测结果
+        if self._pause_target_detection:
+            self.cached_detections = []
+            detections = []
+        else:
+            if skip_det == 0 or self.frame_count % (skip_det + 1) == 0:
+                t0 = time.perf_counter()
+                self.cached_detections = self.detector.detect(frame, queries)
+                det_time = (time.perf_counter() - t0) * 1000  # 转换为毫秒
+                detection_executed = True
+            detections = self.cached_detections  # 使用缓存的检测结果
         
         # 执行手部检测（每帧都执行，因为很快）
         t0 = time.perf_counter()
@@ -509,13 +993,27 @@ class CVAssistSystem:
             t0 = time.perf_counter()
             self.cached_depth = self.depth_estimator.estimate(frame)
             depth_time = (time.perf_counter() - t0) * 1000
+            depth_executed = True
         depth_map = self.cached_depth  # 使用缓存的深度图
         
         # 计算引导指令（只有当同时检测到手和目标时）
         guidance_result = None
+        guidance_state = "idle"
+        ready_to_grab = False
+        stable_ready_frames = 0
+        hand_near_target = False
+        hand_target_distance_px = float('nan')
+        gesture = hands[0].get('gesture', 'unknown') if hands else 'unknown'
         if hands and detections:
             hand = hands[0]      # 取第一只手
             target = detections[0]  # 取第一个目标
+            hand_target_distance_px = float(np.hypot(
+                target['center'][0] - hand['center'][0],
+                target['center'][1] - hand['center'][1],
+            ))
+            hand_near_target = (
+                hand_target_distance_px <= self.config.logging.catch_hand_near_target_px
+            )
             
             # 获取手部和目标的深度值
             hand_depth = 0.5    # 默认中等深度
@@ -526,14 +1024,24 @@ class CVAssistSystem:
                 target_depth = self.depth_estimator.get_depth_at_point(depth_map, target['center'])
             
             # 计算引导指令
+            guidance_t0 = time.perf_counter()
             guidance_result = self.guidance.calculate(
                 hand['center'], target['center'],
                 hand_depth, target_depth,
                 hand.get('gesture', 'unknown')
             )
+            guidance_time = (time.perf_counter() - guidance_t0) * 1000
+            guidance_state = self._guidance_state(guidance_result)
+            ready_to_grab = bool(getattr(guidance_result, 'ready_to_grab', False))
+            stable_ready_frames = int(getattr(guidance_result, 'stable_ready_frames', 0))
         
         # 计算总耗时
-        total_time = (time.perf_counter() - start) * 1000
+        total_time = (time.perf_counter() - perf_start) * 1000
+        frame_end_ts = time.time()
+        has_target = bool(detections)
+        has_hand = bool(hands)
+        has_guidance = guidance_result is not None
+        target_x = float(detections[0]['center'][0]) if detections else float('nan')
         
         # 返回处理结果
         return FrameResult(
@@ -541,13 +1049,37 @@ class CVAssistSystem:
             hands=hands,
             depth_map=depth_map,
             guidance=guidance_result,
+            frame_start_ts=frame_start_ts,
+            frame_end_ts=frame_end_ts,
             total_time_ms=total_time,
             detection_time_ms=det_time,
             hand_time_ms=hand_time,
-            depth_time_ms=depth_time
+            depth_time_ms=depth_time,
+            guidance_time_ms=guidance_time,
+            detection_executed=detection_executed,
+            depth_executed=depth_executed,
+            has_target=has_target,
+            has_hand=has_hand,
+            has_guidance=has_guidance,
+            guidance_state=guidance_state,
+            ready_to_grab=ready_to_grab,
+            stable_ready_frames=stable_ready_frames,
+            gesture=gesture,
+            target_visible=has_target,
+            target_x=target_x,
+            hand_near_target=hand_near_target,
+            hand_target_distance_px=hand_target_distance_px,
+            detections_count=len(detections),
+            hands_count=len(hands),
         )
     
-    def draw_results(self, frame: np.ndarray, result: FrameResult) -> np.ndarray:
+    def draw_results(
+        self,
+        frame: np.ndarray,
+        result: FrameResult,
+        proc_stats: Optional[Dict] = None,
+        e2e_stats: Optional[Dict] = None,
+    ) -> np.ndarray:
         """
         在图像上绘制所有检测结果
         
@@ -582,10 +1114,7 @@ class CVAssistSystem:
         
         # 显示 FPS 信息
         fps = 1000 / result.total_time_ms if result.total_time_ms > 0 else 0
-        if self.fps_counter:
-            # 处理 FPS（仅模型与算法处理时间）
-            self.fps_counter.update(frame_time_ms=result.total_time_ms)
-            proc_stats = self.fps_counter.get_stats()
+        if proc_stats:
             cv2.putText(output, f"Proc FPS: {proc_stats['current']:.1f}",
                        (output.shape[1] - 220, 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -593,9 +1122,7 @@ class CVAssistSystem:
                        (output.shape[1] - 220, 50),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            # 端到端 FPS（采集 + 处理 + 绘制 + 显示等待）
-            if self.e2e_fps_counter:
-                e2e_stats = self.e2e_fps_counter.get_stats()
+            if e2e_stats:
                 cv2.putText(output, f"E2E FPS: {e2e_stats['current']:.1f}",
                            (output.shape[1] - 220, 75),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 255, 150), 1)
@@ -616,6 +1143,7 @@ class CVAssistSystem:
         录制用户语音，使用 ASR 转录并解析目标。
         返回结构化结果，由主线程统一提交状态更新。
         """
+        total_start = time.perf_counter()
         try:
             if self.tts_engine:
                 self._play_voice_prompt_and_wait("正在录音，请给出描述")
@@ -636,7 +1164,13 @@ class CVAssistSystem:
             
             if len(audio) == 0:
                 logger.warning("未录制到音频")
-                return {'status': 'error', 'message': '未录制到音频，请重试'}
+                return {
+                    'status': 'error',
+                    'message': '未录制到音频，请重试',
+                    'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
+                    'voice_asr_time_ms': 0.0,
+                    'raw_text': '',
+                }
             
             logger.info(f"录音完成，开始识别...")
             if self.tts_engine:
@@ -646,12 +1180,20 @@ class CVAssistSystem:
                     self.tts_engine.speak("正在识别")
             
             # 语音识别
+            asr_start = time.perf_counter()
             result = self.asr_engine.transcribe_audio(audio, cfg.record_sample_rate)
+            voice_asr_time_ms = (time.perf_counter() - asr_start) * 1000
             text = result.get('text', '').strip()
             
             if not text:
                 logger.warning("识别结果为空")
-                return {'status': 'error', 'message': '没有识别到内容，请重试'}
+                return {
+                    'status': 'error',
+                    'message': '没有识别到内容，请重试',
+                    'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
+                    'voice_asr_time_ms': voice_asr_time_ms,
+                    'raw_text': '',
+                }
             
             logger.info(f"识别结果: '{text}'")
             
@@ -666,25 +1208,95 @@ class CVAssistSystem:
                     else:
                         logger.debug("Frame buffer is empty, LLM vision will not be used")
             
-            # 解析指令，提取目标物体（优先使用 LLM + Vision，回退到正则解析）
-            target = self.asr_engine.parse_command_with_vision(
+            voice_event = self.asr_engine.parse_voice_event(
                 text=text,
+                has_active_task=self.current_task is not None,
                 frames=frames_snapshot,
-                llm_parser=self.llm_vision_parser
+                llm_parser=self.llm_vision_parser,
             )
-            
-            if target:
-                logger.info(f"语音解析目标成功: {target}")
-                return {'status': 'ok', 'target': target}
+            voice_event['voice_total_time_ms'] = (time.perf_counter() - total_start) * 1000
+            voice_event['voice_asr_time_ms'] = voice_asr_time_ms
+            voice_event['raw_text'] = text
+
+            if voice_event.get('status') == 'ok':
+                logger.info(
+                    "语音事件解析成功: action=%s target=%s",
+                    voice_event.get('action'),
+                    voice_event.get('target'),
+                )
             else:
                 logger.warning(f"无法解析指令: '{text}'")
-                return {'status': 'error', 'message': '抱歉，无法理解您的指令'}
+            return voice_event
             
         except Exception as e:
             logger.error(f"语音输入处理失败: {e}", exc_info=True)
-            return {'status': 'error', 'message': '语音识别出错'}
+            return {
+                'status': 'error',
+                'message': '语音识别出错',
+                'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
+                'voice_asr_time_ms': 0.0,
+                'raw_text': '',
+            }
+
+    def _build_frame_metrics(
+        self,
+        result: FrameResult,
+        capture_time_ms: float,
+        draw_time_ms: float,
+        display_time_ms: float,
+        loop_time_ms: float,
+        proc_stats: Dict,
+        e2e_stats: Dict,
+    ) -> FrameMetrics:
+        """汇总主循环与算法阶段指标为统一单帧事实。"""
+        return FrameMetrics(
+            frame_index=self.frame_count,
+            frame_start_ts=result.frame_start_ts,
+            frame_end_ts=result.frame_end_ts,
+            capture_time_ms=capture_time_ms,
+            process_time_ms=result.total_time_ms,
+            draw_time_ms=draw_time_ms,
+            display_time_ms=display_time_ms,
+            e2e_loop_time_ms=loop_time_ms,
+            detection_time_ms=result.detection_time_ms,
+            hand_time_ms=result.hand_time_ms,
+            depth_time_ms=result.depth_time_ms,
+            guidance_time_ms=result.guidance_time_ms,
+            detection_executed=result.detection_executed,
+            depth_executed=result.depth_executed,
+            detections_count=result.detections_count,
+            hands_count=result.hands_count,
+            has_target=result.has_target,
+            has_hand=result.has_hand,
+            has_guidance=result.has_guidance,
+            guidance_state=result.guidance_state,
+            ready_to_grab=result.ready_to_grab,
+            stable_ready_frames=result.stable_ready_frames,
+            gesture=result.gesture,
+            target_visible=result.target_visible,
+            target_x=result.target_x,
+            hand_near_target=result.hand_near_target,
+            hand_target_distance_px=result.hand_target_distance_px,
+            proc_fps_current=proc_stats.get('current', 0.0),
+            proc_fps_avg=proc_stats.get('average', 0.0),
+            e2e_fps_current=e2e_stats.get('current', 0.0),
+            e2e_fps_avg=e2e_stats.get('average', 0.0),
+        )
+
+    def _maybe_log_task_summary(self):
+        """按配置周期输出任务实时摘要。"""
+        if not self.current_task or not self.config.logging.enable_task_metrics:
+            return
+        now = time.time()
+        interval = max(0.2, float(self.config.logging.task_metrics_interval_sec))
+        if now - self._last_task_summary_ts < interval:
+            return
+        summary = self.task_metrics_collector.build_terminal_summary(now)
+        if summary:
+            logger.info(summary)
+            self._last_task_summary_ts = now
     
-    def run(self, camera_id: int = 0):
+    def run(self, camera_id: Optional[int] = None):
         """
         运行视觉辅助系统主循环
         
@@ -696,8 +1308,11 @@ class CVAssistSystem:
         - 'v': 开始语音输入 (如果启用了ASR)
         
         参数:
-            camera_id: 摄像头 ID，默认 0
+            camera_id: 摄像头 ID，未传入时使用配置文件中的 camera.id
         """
+        if camera_id is None:
+            camera_id = self.config.camera_id
+
         logger.info("启动 CV 视觉辅助系统")
         logger.info(f"控制: q - 退出, d - 切换深度显示")
         
@@ -708,6 +1323,19 @@ class CVAssistSystem:
             self.tts_engine.speak("语音播报已开启")
         
         logger.info(f"检测目标: {self.config.target_queries}")
+        logger.info(f"摄像头选择: {camera_id}")
+
+        # 有预设目标时，启动即进入自动搜索/确认态（无需先按 v 语音触发）
+        if (
+            self.config.target_queries
+            and not self.current_task
+            and not self._pending_task
+        ):
+            preset_target = (self.config.target_queries[0] or "").strip()
+            if preset_target:
+                self._begin_target_search_feedback(preset_target)
+                self._pause_target_detection = False
+                self._start_task(preset_target)
         
         # 尝试打开摄像头，带异常处理
         try:
@@ -739,6 +1367,7 @@ class CVAssistSystem:
         
         show_depth = False   # 是否显示深度图
         frame_counter = 0    # 帧计数器，用于定期输出统计
+        exit_reason = None
         
         try:
             logger.info("开始主循环")
@@ -749,14 +1378,20 @@ class CVAssistSystem:
                 self._drain_voice_results()
 
                 # 读取摄像头帧
+                capture_start = time.perf_counter()
                 try:
                     ret, frame = cap.read()
                 except cv2.error as e:
                     logger.warning(f"摄像头读取错误: {e}")
+                    exit_reason = 'camera_error'
+                    logger.info("主循环结束: 摄像头读取异常")
                     break
+                capture_time_ms = (time.perf_counter() - capture_start) * 1000
                 
                 if not ret:
                     logger.warning("无法读取摄像头帧，可能摄像头已断开")
+                    exit_reason = 'camera_lost'
+                    logger.info("主循环结束: 摄像头读帧失败")
                     break
                 
                 # 水平翻转图像（镜像效果）
@@ -772,15 +1407,36 @@ class CVAssistSystem:
                     result = self.process_frame(frame)
                     frame_counter += 1
                     self._update_target_search_feedback(result.detections)
-                    
-                    # 如果启用了TTS且有引导指令，播放语音
-                    if self.tts_engine and result.guidance:
+                    self._update_pending_task_confirmation(result.detections, time.time())
+
+                    # 更新手部稳定帧计数
+                    if result.has_hand:
+                        self._hand_stable_streak += 1
+                    else:
+                        self._hand_stable_streak = 0
+
+                    # 移动引导指令仅在任务正式激活且手部稳定出现后播报
+                    hand_stable_threshold = max(1, int(getattr(
+                        self.config.guidance, 'hand_stable_frames', 20
+                    )))
+                    hand_is_stable = self._hand_stable_streak >= hand_stable_threshold
+                    if self.current_task and hand_is_stable and self.tts_engine and result.guidance:
+                        self._try_spatial_briefing(result, hand_is_stable)
+                    if self.current_task and hand_is_stable and self.tts_engine and result.guidance:
                         if self._should_speak_guidance(result.guidance):
                             self._speak_guidance(result.guidance)
-                    
+                    if self.current_task:
+                        self._update_proximity_beep(result, time.time())
+                    elif self._proximity_beep:
+                        self._proximity_beep.set_continuous_eligible(False)
+
+                    proc_stats = {}
+                    if self.fps_counter:
+                        self.fps_counter.update(frame_time_ms=result.total_time_ms)
+                        proc_stats = self.fps_counter.get_stats()
+
                     # 每 100 帧记录一次统计
                     if self.fps_counter and frame_counter % 100 == 0:
-                        proc_stats = self.fps_counter.get_stats()
                         if self.e2e_fps_counter:
                             e2e_stats = self.e2e_fps_counter.get_stats()
                             logger.info(f"FPS 统计 [帧 {frame_counter}] | "
@@ -800,7 +1456,10 @@ class CVAssistSystem:
                     continue
                 
                 # 绘制结果
-                output = self.draw_results(frame, result)
+                draw_start = time.perf_counter()
+                prev_e2e_stats = self.e2e_fps_counter.get_stats() if self.e2e_fps_counter else {}
+                output = self.draw_results(frame, result, proc_stats=proc_stats, e2e_stats=prev_e2e_stats)
+                draw_time_ms = (time.perf_counter() - draw_start) * 1000
                 
                 # 如果启用了深度显示，在右上角显示深度图
                 if show_depth and result.depth_map is not None:
@@ -809,16 +1468,29 @@ class CVAssistSystem:
                     output[0:120, -160:] = depth_vis  # 放在右上角
                 
                 try:
-                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    vis = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
+                    if vis < 1:
+                        exit_reason = 'window_closed'
+                        logger.info(
+                            "主循环结束: 视频窗口已关闭或变为不可见 (WND_PROP_VISIBLE=%s)。"
+                            "若未主动关窗口，可能是误点「×」、最小化或显示驱动/OpenCV 高 GUI 异常。",
+                            vis,
+                        )
                         break
-                except cv2.error:
+                except cv2.error as e:
+                    exit_reason = 'window_closed'
+                    logger.info("主循环结束: 无法查询窗口状态，视为窗口已关闭 (%s)", e)
                     break
 
+                display_start = time.perf_counter()
                 cv2.imshow(window_name, output)
                 
                 # 如果窗口被关闭，cv2.getWindowProperty返回值会小于1
                 key = cv2.waitKey(1) & 0xFF
+                display_time_ms = (time.perf_counter() - display_start) * 1000
                 if key == ord('q'):
+                    exit_reason = 'user_quit'
+                    logger.info("主循环结束: 用户按下 q 键退出")
                     break
                 elif key == ord('d'):
                     show_depth = not show_depth
@@ -831,14 +1503,57 @@ class CVAssistSystem:
                         logger.warning("ASR 功能未启用")
 
                 # 端到端 FPS：包含采集、处理、绘制和显示等待
+                loop_time_ms = (time.perf_counter() - loop_start) * 1000
                 if self.e2e_fps_counter:
-                    loop_time_ms = (time.perf_counter() - loop_start) * 1000
                     self.e2e_fps_counter.update(frame_time_ms=loop_time_ms)
+                    e2e_stats = self.e2e_fps_counter.get_stats()
+                else:
+                    e2e_stats = {}
+
+                if self.current_task:
+                    frame_metrics = self._build_frame_metrics(
+                        result=result,
+                        capture_time_ms=capture_time_ms,
+                        draw_time_ms=draw_time_ms,
+                        display_time_ms=display_time_ms,
+                        loop_time_ms=loop_time_ms,
+                        proc_stats=proc_stats,
+                        e2e_stats=e2e_stats,
+                    )
+                    self.task_metrics_collector.record_frame(frame_metrics)
+                    finish_reason = self.task_metrics_collector.should_finish_task()
+                    if finish_reason:
+                        target_query = self.current_task['target_query']
+                        if finish_reason == 'success':
+                            self._speak_lifecycle_message(f"任务完成，已抓取{target_query}")
+                        elif finish_reason == 'lost_target':
+                            self._speak_lifecycle_message(f"任务终止，无法定位{target_query}")
+                        self._finish_current_task(finish_reason)
+                        self._begin_target_search_feedback("")
+                    else:
+                        self._maybe_log_task_summary()
+
+                if self._requested_shutdown:
+                    exit_reason = 'voice_exit'
+                    logger.info("主循环结束: 语音指令请求退出程序")
+                    break
         except KeyboardInterrupt:
             logger.info("收到键盘中断信号")
+            exit_reason = 'interrupt'
         except Exception as e:
             logger.exception(f"运行过程中发生异常: {e}")
+            exit_reason = 'error'
         finally:
+            if exit_reason:
+                logger.info("本次运行退出原因: %s", exit_reason)
+            if self.current_task:
+                if exit_reason in ('window_closed', 'user_quit', 'voice_exit', 'interrupt'):
+                    final_reason = 'user_exit'
+                elif exit_reason in ('camera_lost', 'camera_error'):
+                    final_reason = 'error'
+                else:
+                    final_reason = exit_reason or 'error'
+                self._finish_current_task(final_reason)
             # 输出最终统计
             if self.fps_counter:
                 stats = self.fps_counter.get_stats()
@@ -856,6 +1571,8 @@ class CVAssistSystem:
                 logger.info("="*60)
             
             # 释放资源
+            if self.report_writer:
+                self.report_writer.stop(timeout_sec=2.0)
             cap.release()
             cv2.destroyAllWindows()
             logger.info("系统已关闭")
@@ -865,11 +1582,11 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='CV 视觉辅助系统')
-    parser.add_argument('--config', choices=['fast', 'balanced', 'voice', 'tts', 'mimo-tts'], 
+    parser.add_argument('--config', choices=['fast', 'balanced', 'voice', 'tts', 'mimo-tts', 'light'], 
                        default='balanced',
                        help='配置模式: fast=快速, balanced=平衡, voice=启用ASR+TTS, tts=仅启用TTS, mimo-tts=MiMo云端TTS')
-    parser.add_argument('--camera', type=int, default=0,
-                       help='摄像头 ID')
+    parser.add_argument('--camera', type=int, default=None,
+                       help='摄像头 ID，未传时使用 config.yaml 中的 camera.id')
     args = parser.parse_args()
 
     config = load_config(profile=args.config)

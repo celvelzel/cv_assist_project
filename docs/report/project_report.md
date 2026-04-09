@@ -37,7 +37,7 @@
 系统整合了多个复杂的深度学习模型（OWL-ViT, MiDaS, MediaPipe, Whisper），不仅对硬件要求不一，而且不同使用场景（仅测试、仅TTS、完整语音交互等）需要的参数配置差异很大。此外，不同操作系统的部署也有细微差别。
 
 **解决方法：**
-*   **配置文件与预设 (Configuration Profiles)：** 重构了配置管理系统，外部化为 `config.yaml`。设计了级联加载优先级（环境变量 > profile overrides > 基础配置）。提供了如 `fast`, `balanced`, `tts`, `voice`, `mimo-tts` 等多种预设，方便用户一键切换场景。
+*   **配置文件与预设 (Configuration Profiles)：** 重构了配置管理系统，外部化为 `config.yaml`。设计了级联加载优先级（环境变量 > profile overrides > 基础配置）。提供了如 `fast`, `balanced`, `no-voice` 等多种预设，方便用户一键切换场景。
 *   **敏感信息隔离：** 使用 `.env` 文件隔离如 Poe API Key 和 MiMo TTS API Key 等敏感信息。
 *   **一键部署脚本：** 编写了兼容 Windows 的 `run.bat` 和兼容 Linux/macOS 的 `run.sh`，自动处理环境创建、依赖安装和 UTF-8 编码设置等繁琐步骤，降低了用户的使用门槛。
 
