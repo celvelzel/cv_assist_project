@@ -146,10 +146,12 @@ class TestLLMVisionParser:
         )
         
         frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
-        result = parser.parse_with_vision("find a phone", frames)
-        
+        result, poe_ms, invoked = parser.parse_with_vision("find a phone", frames)
+
         assert result is None
-    
+        assert poe_ms is None
+        assert invoked is False
+
     def test_parse_with_vision_empty_text(self):
         """Test parse_with_vision with empty text"""
         parser = LLMVisionParser(
@@ -158,10 +160,12 @@ class TestLLMVisionParser:
         )
         
         frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
-        result = parser.parse_with_vision("", frames)
-        
+        result, poe_ms, invoked = parser.parse_with_vision("", frames)
+
         assert result is None
-    
+        assert poe_ms is None
+        assert invoked is False
+
     def test_parse_with_vision_no_frames(self):
         """Test parse_with_vision with no frames"""
         parser = LLMVisionParser(
@@ -169,10 +173,12 @@ class TestLLMVisionParser:
             model_name="deepseek-v3.2"
         )
         
-        result = parser.parse_with_vision("find a phone", None)
-        
+        result, poe_ms, invoked = parser.parse_with_vision("find a phone", None)
+
         assert result is None
-    
+        assert poe_ms is None
+        assert invoked is False
+
     @patch('audio.llm_vision.openai')
     def test_call_poe_api_with_retry_success(self, mock_openai):
         """Test successful Poe API call"""
@@ -181,16 +187,17 @@ class TestLLMVisionParser:
             model_name="deepseek-v3.2"
         )
         
-        # Mock API response
-        mock_response = Mock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = '{"target": "phone"}'
         parser.client.chat.completions.create.return_value = mock_response
         
         message_content = [{"type": "text", "text": "test prompt"}]
-        result = parser._call_poe_api_with_retry(message_content)
-        
+        result, elapsed_ms = parser._call_poe_api_with_retry(message_content)
+
         assert result is not None
         assert result['target'] == 'phone'
+        assert elapsed_ms >= 0.0
     
     @patch('audio.llm_vision.openai')
     def test_call_poe_api_with_retry_timeout(self, mock_openai):
@@ -207,10 +214,10 @@ class TestLLMVisionParser:
         parser.client.chat.completions.create.side_effect = openai.APITimeoutError("Timeout")
         
         message_content = [{"type": "text", "text": "test prompt"}]
-        result = parser._call_poe_api_with_retry(message_content)
-        
-        # Should return None after retry
+        result, elapsed_ms = parser._call_poe_api_with_retry(message_content)
+
         assert result is None
+        assert elapsed_ms >= 0.0
 
 
 class TestLLMVisionIntegration:
@@ -223,15 +230,15 @@ class TestLLMVisionIntegration:
             asr = ASREngine(model_name="base")
             frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
             
-            # Should fall back to regex parsing
-            result = asr.parse_command_with_vision(
+            target, poe_ms, invoked = asr.parse_command_with_vision(
                 "找到手机",
                 frames=frames,
                 llm_parser=None
             )
-            
-            # Should parse "手机"
-            assert result is not None
+
+            assert target is not None
+            assert poe_ms is None
+            assert invoked is False
     
     def test_create_llm_vision_parser_no_key(self):
         """Test factory function without API key"""

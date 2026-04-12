@@ -29,7 +29,7 @@ class VoiceEventParsingTests(unittest.TestCase):
 
     def test_parse_voice_event_returns_switch_target_for_active_task(self):
         engine = self._build_engine()
-        engine.parse_command_with_vision = lambda text, frames=None, llm_parser=None: "a bottle"
+        engine.parse_command_with_vision = lambda text, frames=None, llm_parser=None: ("a bottle", None, False)
 
         event = engine.parse_voice_event("帮我找一下瓶子", has_active_task=True)
 
@@ -113,6 +113,10 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         self.assertIsNotNone(report["completion_summary"]["target_x_displacement_px"]["value"])
         self.assertGreaterEqual(report["completion_summary"]["target_x_displacement_px"]["value"], 20.0)
         self.assertGreater(report["completion_summary"]["ready_to_catch_elapsed_sec"]["value"], 0.0)
+        self.assertEqual(report["voice_summary"]["voice_total_time_sec"]["value"], 0.5)
+        self.assertEqual(report["voice_summary"]["voice_asr_time_sec"]["value"], 0.12)
+        self.assertIn("capture_time_avg_sec", report["latency_summary"])
+        self.assertIn("process_time_p50_sec", report["latency_distribution"])
 
     def test_collector_does_not_trigger_success_without_sufficient_displacement(self):
         """位移未达阈值时不应触发成功。"""
@@ -250,7 +254,9 @@ class TaskMetricsCollectorTests(unittest.TestCase):
             ready_confirm_window_sec=1.5,
             lost_target_window_sec=3.0,
         )
-        collector.start_task("task_0004", "a bottle", 400.0, "session-1")
+        collector.start_task(
+            "task_0004", "a bottle", 400.0, "session-1", target_search_to_activate_sec=12.3
+        )
         collector.record_voice_metrics(10611.5, 864.2, "find bottle")
         collector.record_frame(
             self._frame(
@@ -272,10 +278,18 @@ class TaskMetricsCollectorTests(unittest.TestCase):
         self.assertIn("task_0004", summary)
         self.assertIn("a bottle", summary)
         self.assertIn("ready(就绪)", summary)
-        self.assertIn("fps=", summary)
-        self.assertIn("det=", summary)
-        self.assertIn("ready=", summary)
+        self.assertIn("poe=N/A", summary)
+        self.assertIn("det1=", summary)
+        self.assertIn("det_run=", summary)
+        self.assertIn("s2act=12.3s", summary)
         self.assertEqual(summary.count("\n"), 0)
+
+    def test_format_ms_display_uses_s_above_threshold(self):
+        fmt = TaskMetricsCollector._format_ms_display
+        self.assertEqual(fmt(0.0), "0.0ms")
+        self.assertEqual(fmt(999.9), "999.9ms")
+        self.assertEqual(fmt(1000.0), "1.0s")
+        self.assertEqual(fmt(2038.0), "2.0s")
 
 
 class AsyncReportWriterTests(unittest.TestCase):

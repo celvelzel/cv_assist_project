@@ -318,6 +318,8 @@ class CVAssistSystem:
         self._lifecycle_speaking = False
         self._search_feedback_target = None
         self._search_feedback_state = "idle"
+        # 「开始寻找目标」至任务正式激活的耗时起点（语音播报前或挂起任务时刷新）
+        self._search_phase_start_ts: Optional[float] = None
         self._target_found_streak = 0
         self._target_missing_streak = 0
         self._target_missing_last_spoken_ts = 0.0  # 上次播报"未找到"的时间戳
@@ -365,6 +367,7 @@ class CVAssistSystem:
             self.report_writer.start()
         else:
             self.report_writer = None
+        self._last_under_suppress = False
 
     def _reset_tts_context(self):
         """目标切换后清理播报上下文，避免旧指令残留。"""
@@ -457,6 +460,7 @@ class CVAssistSystem:
         target = (target or "").strip()
         self._search_feedback_target = target or None
         self._search_feedback_state = "searching" if target else "idle"
+        self._search_phase_start_ts = None
         self._target_found_streak = 0
         self._target_missing_streak = 0
         self._target_missing_last_spoken_ts = 0.0
@@ -477,6 +481,7 @@ class CVAssistSystem:
         }
         self._pending_task_target_since_ts = None
         self.task_state = "confirming"
+        self._search_phase_start_ts = time.time()
         logger.info("任务进入确认等待: task_id=%s target=%s 需持续检测 %.1f 秒",
                     task_id, target, self.config.logging.task_start_confirm_window_sec)
 
@@ -493,6 +498,10 @@ class CVAssistSystem:
         task_id = pending["task_id"]
         voice_event = pending.get("voice_event")
 
+        search_to_activate_sec = None
+        if self._search_phase_start_ts is not None:
+            search_to_activate_sec = max(0.0, now - self._search_phase_start_ts)
+
         self.current_task = {
             "task_id": task_id,
             "target_query": target,
@@ -505,17 +514,25 @@ class CVAssistSystem:
             target_query=target,
             start_time=now,
             session_id=self.session_id,
+            target_search_to_activate_sec=search_to_activate_sec,
         )
         if voice_event:
             self.task_metrics_collector.record_voice_metrics(
                 voice_total_time_ms=voice_event.get("voice_total_time_ms", 0.0),
                 voice_asr_time_ms=voice_event.get("voice_asr_time_ms", 0.0),
                 raw_text=voice_event.get("raw_text", ""),
+                voice_record_ms=voice_event.get("voice_record_ms"),
+                voice_tts_prompt_ms=voice_event.get("voice_tts_prompt_ms"),
+                llm_poe_ms=voice_event.get("llm_poe_ms"),
+                llm_poe_invoked=bool(voice_event.get("llm_poe_invoked", False)),
             )
+        self._last_under_suppress = time.time() < self._suppress_guidance_until_ts
         logger.info("任务正式激活: task_id=%s target=%s", task_id, target)
         if self._proximity_beep:
             self._proximity_beep.reset_cooldown()
-        self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
+        # 启用空间简报时：与首次方位简报合并为一条生命周期播报；否则此处单独播报
+        if not getattr(self.config.guidance, "enable_spatial_briefing", True):
+            self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
 
     def _start_task_now(self, target: str):
         """立即激活任务（用于预设目标自动启动）。"""
@@ -537,6 +554,7 @@ class CVAssistSystem:
             target_query=target,
             start_time=now,
             session_id=self.session_id,
+            target_search_to_activate_sec=None,
         )
         logger.info("预设目标任务已自动激活: task_id=%s target=%s", task_id, target)
         if self._proximity_beep:
@@ -695,7 +713,7 @@ class CVAssistSystem:
         return (now - self._last_instruction_ts) >= cfg.tts_instruction_interval_sec
 
     def _try_spatial_briefing(self, result: FrameResult, hand_stable: bool) -> None:
-        """任务开始后首次：播报目标相对手的钟点方向与约略距离，再进入常规定向引导。"""
+        """任务开始后首次：播报「已找到目标 + 方位与距离」合并文案（一条生命周期 TTS），再进入常规定向引导。"""
         gcfg = self.config.guidance
         if not getattr(gcfg, "enable_spatial_briefing", True):
             return
@@ -736,11 +754,18 @@ class CVAssistSystem:
             depth_span=float(getattr(gcfg, "spatial_briefing_depth_span", 0.52)),
             distance_gamma=float(getattr(gcfg, "spatial_briefing_distance_gamma", 1.12)),
         )
-        text = (
-            f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
-            f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
+        target_q = (self.current_task.get("target_query") or "").strip()
+        intro = (
+            f"已找到{target_q}，开始执行任务，请伸出抓握手。"
+            if target_q
+            else ""
         )
-        self._speak_priority_message(text)
+        text = (
+            intro
+            + f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
+            + f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
+        )
+        self._speak_lifecycle_message(text)
         self._spatial_briefing_task_id = tid
 
     def _proximity_density_t(self, distance_px: float, depth_diff: float) -> float:
@@ -859,6 +884,43 @@ class CVAssistSystem:
         self._last_instruction_ts = now
         if state in ('ready', 'grabbed'):
             self._last_grab_ts = now
+        if self.config.logging.enable_task_metrics:
+            self.task_metrics_collector.note_first_guidance_instruction_tts(now)
+
+    def _sample_task_resources(self):
+        """CPU、进程内存、GPU 显存、全机网络吞吐（网络为相对上一采样间隔；CPU/网依赖 psutil）。"""
+        if not self.config.logging.enable_task_metrics or not self.current_task:
+            return
+        gpu_mb = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_mb = torch.cuda.memory_allocated() / (1024.0 ** 2)
+        except Exception:
+            pass
+        now = time.time()
+        try:
+            import psutil  # type: ignore[import-untyped]
+        except ImportError:
+            self.task_metrics_collector.record_resource_snapshot(
+                gpu_memory_mb=gpu_mb,
+                now=now,
+            )
+            return
+        proc = psutil.Process()
+        cpu_percent = proc.cpu_percent(interval=None)
+        memory_rss_mb = proc.memory_info().rss / (1024.0 ** 2)
+        net_io = psutil.net_io_counters()
+        net_sent = net_io.bytes_sent if net_io is not None else None
+        net_recv = net_io.bytes_recv if net_io is not None else None
+        self.task_metrics_collector.record_resource_snapshot(
+            cpu_percent=cpu_percent,
+            memory_rss_mb=memory_rss_mb,
+            gpu_memory_mb=gpu_mb,
+            net_bytes_sent=net_sent,
+            net_bytes_recv=net_recv,
+            now=now,
+        )
 
     def _start_voice_input_async(self):
         """异步启动语音输入，避免主循环阻塞。"""
@@ -935,6 +997,7 @@ class CVAssistSystem:
 
             if self.tts_engine and getattr(self.config.audio, 'voice_feedback_on_target_confirm', True):
                 confirm_message = message or f"开始寻找{target}"
+                self._search_phase_start_ts = time.time()
                 self._speak_lifecycle_message(confirm_message)
     
     def process_frame(self, frame: np.ndarray,
@@ -1144,13 +1207,17 @@ class CVAssistSystem:
         返回结构化结果，由主线程统一提交状态更新。
         """
         total_start = time.perf_counter()
+        voice_tts_prompt_ms = None
+        voice_record_ms = None
         try:
             if self.tts_engine:
+                t_prompt = time.perf_counter()
                 self._play_voice_prompt_and_wait("正在录音，请给出描述")
+                voice_tts_prompt_ms = (time.perf_counter() - t_prompt) * 1000.0
             logger.info("=== 开始语音录制 ===")
-            
-            # 录制音频
+
             cfg = self.config.audio
+            rec_t0 = time.perf_counter()
             if cfg.auto_detect_silence:
                 logger.info(f"录音中... (自动检测静音，最长 {cfg.record_duration}s)")
                 audio = self.audio_recorder.record_until_silence(
@@ -1161,6 +1228,7 @@ class CVAssistSystem:
             else:
                 logger.info(f"录音中... ({cfg.record_duration}s)")
                 audio = self.audio_recorder.record(cfg.record_duration)
+            voice_record_ms = (time.perf_counter() - rec_t0) * 1000.0
             
             if len(audio) == 0:
                 logger.warning("未录制到音频")
@@ -1170,6 +1238,10 @@ class CVAssistSystem:
                     'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
                     'voice_asr_time_ms': 0.0,
                     'raw_text': '',
+                    'voice_record_ms': voice_record_ms,
+                    'voice_tts_prompt_ms': voice_tts_prompt_ms,
+                    'llm_poe_ms': None,
+                    'llm_poe_invoked': False,
                 }
             
             logger.info(f"录音完成，开始识别...")
@@ -1179,10 +1251,12 @@ class CVAssistSystem:
                 else:
                     self.tts_engine.speak("正在识别")
             
-            # 语音识别
+            # 语音识别（初步识别：Whisper ASR，耗时见 asr_time_ms / 日志 asr_ms）
             asr_start = time.perf_counter()
             result = self.asr_engine.transcribe_audio(audio, cfg.record_sample_rate)
-            voice_asr_time_ms = (time.perf_counter() - asr_start) * 1000
+            voice_asr_time_ms = float(result.get("asr_time_ms") or 0.0)
+            if voice_asr_time_ms <= 0.0:
+                voice_asr_time_ms = (time.perf_counter() - asr_start) * 1000.0
             text = result.get('text', '').strip()
             
             if not text:
@@ -1193,9 +1267,17 @@ class CVAssistSystem:
                     'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
                     'voice_asr_time_ms': voice_asr_time_ms,
                     'raw_text': '',
+                    'voice_record_ms': voice_record_ms,
+                    'voice_tts_prompt_ms': voice_tts_prompt_ms,
+                    'llm_poe_ms': None,
+                    'llm_poe_invoked': False,
                 }
             
-            logger.info(f"识别结果: '{text}'")
+            logger.info(
+                "识别结果: '%s' | 初步识别 asr_ms=%.0fms",
+                text,
+                voice_asr_time_ms,
+            )
             
             # 准备用于 LLM Vision 的帧
             frames_snapshot = None
@@ -1217,6 +1299,12 @@ class CVAssistSystem:
             voice_event['voice_total_time_ms'] = (time.perf_counter() - total_start) * 1000
             voice_event['voice_asr_time_ms'] = voice_asr_time_ms
             voice_event['raw_text'] = text
+            voice_event['voice_record_ms'] = voice_record_ms
+            voice_event['voice_tts_prompt_ms'] = voice_tts_prompt_ms
+            if 'llm_poe_ms' not in voice_event:
+                voice_event['llm_poe_ms'] = None
+            if 'llm_poe_invoked' not in voice_event:
+                voice_event['llm_poe_invoked'] = False
 
             if voice_event.get('status') == 'ok':
                 logger.info(
@@ -1236,6 +1324,10 @@ class CVAssistSystem:
                 'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
                 'voice_asr_time_ms': 0.0,
                 'raw_text': '',
+                'voice_record_ms': None,
+                'voice_tts_prompt_ms': None,
+                'llm_poe_ms': None,
+                'llm_poe_invoked': False,
             }
 
     def _build_frame_metrics(
@@ -1291,6 +1383,7 @@ class CVAssistSystem:
         interval = max(0.2, float(self.config.logging.task_metrics_interval_sec))
         if now - self._last_task_summary_ts < interval:
             return
+        self._sample_task_resources()
         summary = self.task_metrics_collector.build_terminal_summary(now)
         if summary:
             logger.info(summary)
@@ -1389,6 +1482,8 @@ class CVAssistSystem:
                 capture_time_ms = (time.perf_counter() - capture_start) * 1000
                 
                 if not ret:
+                    if self.current_task:
+                        self.task_metrics_collector.record_camera_read_failure()
                     logger.warning("无法读取摄像头帧，可能摄像头已断开")
                     exit_reason = 'camera_lost'
                     logger.info("主循环结束: 摄像头读帧失败")
@@ -1521,6 +1616,13 @@ class CVAssistSystem:
                         e2e_stats=e2e_stats,
                     )
                     self.task_metrics_collector.record_frame(frame_metrics)
+                    now_loop = time.time()
+                    under = now_loop < self._suppress_guidance_until_ts
+                    if self._last_under_suppress and not under:
+                        self.task_metrics_collector.record_post_suppress_first_frame_process_ms(
+                            result.total_time_ms
+                        )
+                    self._last_under_suppress = under
                     finish_reason = self.task_metrics_collector.should_finish_task()
                     if finish_reason:
                         target_query = self.current_task['target_query']

@@ -719,7 +719,7 @@ class SystemConfig:
     llm_vision: LLMVisionConfig = field(default_factory=LLMVisionConfig)
     # LLM 视觉增强配置（Poe API、模型选择）
 
-    target_queries: List[str] = field(default_factory=lambda: ["a bottle"])
+    target_queries: List[str] = field(default_factory=list)
     # 默认检测目标列表（OWL-ViT 的文本查询条件）。
     # 效果: 系统会检测画面中符合这些文本描述的物体。默认预置为 "a bottle"。
     # 格式: 使用英文名词短语，如 "a cup", "a bottle", "a person"。

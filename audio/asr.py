@@ -3,11 +3,12 @@
 使用 OpenAI Whisper 进行语音转文字
 """
 
+import time
 import torch
 import logging
 import numpy as np
 import re
-from typing import Optional
+from typing import Optional, Tuple
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -141,18 +142,21 @@ class ASREngine:
             audio_data = whisper.load_audio(audio_path)
             kwargs, resolved_language = self._build_transcribe_kwargs(audio_data)
 
+            t0 = time.perf_counter()
             # 使用 Whisper 转录
             result = self.model.transcribe(
                 audio_path,
                 **kwargs
             )
+            asr_ms = (time.perf_counter() - t0) * 1000.0
             
             text = result['text'].strip()
-            logger.info(f"ASR 识别结果: '{text}'")
+            logger.info(f"ASR 识别结果: '{text}' | asr_ms={asr_ms:.0f}ms")
             
             output = {
                 'text': text,
-                'language': result.get('language', resolved_language)
+                'language': result.get('language', resolved_language),
+                'asr_time_ms': asr_ms,
             }
             
             if return_timestamps:
@@ -173,9 +177,10 @@ class ASREngine:
             sample_rate: 采样率 (Whisper 内部会重采样到 16kHz)
             
         返回:
-            包含识别结果的字典
+            包含识别结果的字典: text, language, asr_time_ms（初步识别耗时，毫秒）
         """
         try:
+            t0 = time.perf_counter()
             # 确保音频数据格式正确
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
@@ -195,11 +200,13 @@ class ASREngine:
             )
             
             text = result['text'].strip()
-            logger.info(f"ASR 识别结果: '{text}'")
+            asr_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(f"ASR 识别结果: '{text}' | asr_ms={asr_ms:.0f}ms")
             
             return {
                 'text': text,
-                'language': result.get('language', resolved_language)
+                'language': result.get('language', resolved_language),
+                'asr_time_ms': asr_ms,
             }
             
         except Exception as e:
@@ -320,7 +327,7 @@ class ASREngine:
         if control_event:
             return control_event
 
-        target = self.parse_command_with_vision(
+        target, llm_poe_ms, llm_poe_invoked = self.parse_command_with_vision(
             text=normalized_text,
             frames=frames,
             llm_parser=llm_parser,
@@ -331,6 +338,8 @@ class ASREngine:
                 "action": None,
                 "target": None,
                 "message": "抱歉，无法理解您的指令",
+                "llm_poe_ms": llm_poe_ms,
+                "llm_poe_invoked": llm_poe_invoked,
             }
 
         action = "switch_target" if has_active_task else "set_target"
@@ -345,12 +354,16 @@ class ASREngine:
             "action": action,
             "target": target,
             "message": message,
+            "llm_poe_ms": llm_poe_ms,
+            "llm_poe_invoked": llm_poe_invoked,
         }
-    
-    def parse_command_with_vision(self,
-                                   text: str,
-                                   frames: Optional[list] = None,
-                                   llm_parser=None) -> Optional[str]:
+
+    def parse_command_with_vision(
+        self,
+        text: str,
+        frames: Optional[list] = None,
+        llm_parser=None,
+    ) -> Tuple[Optional[str], Optional[float], bool]:
         """
         解析用户指令，优先使用 LLM + 视觉上下文，回退到正则解析
         
@@ -360,55 +373,57 @@ class ASREngine:
             llm_parser: LLMVisionParser 实例（可选）
             
         返回:
-            提取的目标物体名称
-            
+            (提取的目标物体名称或 None, Poe 耗时毫秒或 None, 是否实际调用过 Poe)
+
         工作流程:
             1. 如果提供了 LLM parser 和 frames，尝试使用 LLM 解析
             2. 如果 LLM 解析成功，返回 LLM 结果
             3. 如果 LLM 失败或未提供，回退到正则 parse_command()
-            4. 记录使用的方法 (LLM vs Regex)
+            4. 未调用 Poe 时 llm_poe_ms 为 None，llm_poe_invoked 为 False（禁止用 0 表示未调用）
         """
         if not text or not text.strip():
             logger.warning("Empty text provided to parse_command_with_vision")
-            return None
-        
-        # 尝试 LLM 视觉解析
+            return None, None, False
+
+        llm_poe_ms: Optional[float] = None
+        llm_poe_invoked = False
         if llm_parser is not None and frames:
             try:
                 logger.debug(f"Attempting LLM vision parsing: text='{text}', frames={len(frames)}")
-                result = llm_parser.parse_with_vision(text, frames)
-                
-                if result and 'target' in result:
-                    target = result['target'].strip()
+                result, llm_poe_ms, llm_poe_invoked = llm_parser.parse_with_vision(text, frames)
+
+                if result and "target" in result:
+                    target = result["target"].strip()
                     if target:
                         logger.info(
                             f"LLM vision parsing succeeded: "
                             f"'{text}' -> '{target}'"
                         )
-                        return target
+                        return target, llm_poe_ms, llm_poe_invoked
                 else:
                     logger.debug("LLM vision parsing returned empty result")
-                    
+
             except Exception as e:
                 logger.error(
                     f"LLM vision parsing exception: {e}. "
                     f"Falling back to regex parsing.",
-                    exc_info=True
+                    exc_info=True,
                 )
+                llm_poe_ms = None
+                llm_poe_invoked = False
         else:
             if llm_parser is None:
                 logger.debug("No LLM parser provided, using regex parsing")
             if not frames:
                 logger.debug("No frames provided, using regex parsing")
-        
-        # 回退到正则解析
+
         logger.debug(f"Falling back to regex parse_command: '{text}'")
         target = self.parse_command(text)
-        
+
         if target:
             logger.info(f"Regex parsing result: '{text}' -> '{target}'")
-            return target
-        
+            return target, llm_poe_ms if llm_poe_invoked else None, llm_poe_invoked
+
         logger.warning(f"Both LLM and regex parsing failed for: '{text}'")
-        return None
+        return None, llm_poe_ms if llm_poe_invoked else None, llm_poe_invoked
 
