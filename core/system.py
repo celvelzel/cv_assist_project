@@ -530,9 +530,8 @@ class CVAssistSystem:
         logger.info("任务正式激活: task_id=%s target=%s", task_id, target)
         if self._proximity_beep:
             self._proximity_beep.reset_cooldown()
-        # 启用空间简报时：与首次方位简报合并为一条生命周期播报；否则此处单独播报
-        if not getattr(self.config.guidance, "enable_spatial_briefing", True):
-            self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
+        # 「请伸出抓握手」须在任务开始即播报，勿与依赖手部稳定后的空间简报捆在一起
+        self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
 
     def _start_task_now(self, target: str):
         """立即激活任务（用于预设目标自动启动）。"""
@@ -559,6 +558,8 @@ class CVAssistSystem:
         logger.info("预设目标任务已自动激活: task_id=%s target=%s", task_id, target)
         if self._proximity_beep:
             self._proximity_beep.reset_cooldown()
+        if getattr(self.config.guidance, "enable_spatial_briefing", True):
+            self._speak_lifecycle_message(f"已找到{target}，开始执行任务，请伸出抓握手")
 
     def _update_pending_task_confirmation(self, detections: List[Dict], now: float):
         """主循环每帧调用：根据当前检测结果推进任务开始确认进度。"""
@@ -713,7 +714,10 @@ class CVAssistSystem:
         return (now - self._last_instruction_ts) >= cfg.tts_instruction_interval_sec
 
     def _try_spatial_briefing(self, result: FrameResult, hand_stable: bool) -> None:
-        """任务开始后首次：播报「已找到目标 + 方位与距离」合并文案（一条生命周期 TTS），再进入常规定向引导。"""
+        """任务开始后首次（手部已稳定、已能算引导）：播报方位与距离简报（一条生命周期 TTS）。
+
+        「已找到…请伸出抓握手」已在任务激活时单独播报，此处不再重复。
+        """
         gcfg = self.config.guidance
         if not getattr(gcfg, "enable_spatial_briefing", True):
             return
@@ -754,16 +758,9 @@ class CVAssistSystem:
             depth_span=float(getattr(gcfg, "spatial_briefing_depth_span", 0.52)),
             distance_gamma=float(getattr(gcfg, "spatial_briefing_distance_gamma", 1.12)),
         )
-        target_q = (self.current_task.get("target_query") or "").strip()
-        intro = (
-            f"已找到{target_q}，开始执行任务，请伸出抓握手。"
-            if target_q
-            else ""
-        )
         text = (
-            intro
-            + f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
-            + f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
+            f"目标在你的{hour}点钟方向，大约{meters:.1f}米。"
+            f"接下来请根据语音提示向前或向后移动，再配合左右与上下对准。"
         )
         self._speak_lifecycle_message(text)
         self._spatial_briefing_task_id = tid
