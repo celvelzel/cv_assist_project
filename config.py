@@ -410,6 +410,11 @@ class AudioConfig:
     # 可选值: 参考 MiMo API 文档中提供的音色列表。
     # 效果: 不同音色有不同的语音风格（男声/女声/童声等）。
 
+    mimo_lifecycle_wait_playback_idle_sec: float = 4.0
+    # speak_lifecycle 抢占前等待异步队列与 pygame 播放空闲的上限（秒）。
+    # 效果: 过大会让生命周期类播报明显晚于日志；过小可能截断尚未播完的引导句。
+    # 推荐: 3.0～5.0 秒（原先硬编码约 12 秒）。
+
     # ---- 近距离滴滴声（倒车雷达式）----
 
     proximity_beep_enabled: bool = True
@@ -534,10 +539,10 @@ class AudioConfig:
     # 效果: 值越大容忍短暂丢失的时间越长。
     # 推荐: 45 帧（约 1.5 秒 @ 30fps），避免因短暂遮挡误报"丢失"。
 
-    target_missing_repeat_interval_sec: float = 30.0
+    target_missing_repeat_interval_sec: float = 10.0
     # 未进入任务时"暂未找到目标"提示的重复播报间隔（秒）。
     # 效果: 在非任务状态下，每隔此秒数重复提醒用户调整位置。任务进行中不重复。
-    # 推荐: 30.0 秒。
+    # 推荐: 10.0 秒。
 
     guidance_suppress_after_voice_sec: float = 1.5
     # 语音交互后抑制引导播报的时间（秒）。
@@ -550,13 +555,14 @@ class AudioConfig:
     # 按住 v 达到该秒数后视为「长按」，开始录音并播报已进入语音输入。
 
     voice_periodic_hint_grace_sec: float = 8.0
-    # 启动主循环后延迟多久再开始周期性长按提示（秒）。
+    # 摄像头就绪且 pynput 长按 v 监听启动后，延迟多久首次播报周期性提示（秒）。
 
     voice_periodic_hint_interval_sec: float = 55.0
     # 周期性提示「请长按 v…」的最小间隔（秒）。
 
     voice_periodic_hint_text: str = "请长按 v 键进入物体识别"
-    # 启动后周期性语音提示文案。
+    # 周期性提示文案。仅在 idle、无任务/无挂起、且 target_queries 与搜索反馈目标均为空时播报；
+    # 一旦通过语音/预设更新了检测目标，即停止周期提示直至再次回到上述状态。
 
     voice_v_short_press_message: str = "请长按 v 键进入语音输入，当前操作不规范"
     # 按下 v 但未达到长按阈值即松开时的提示。
@@ -565,6 +571,12 @@ class AudioConfig:
         "已进入语音输入，请说出要寻找的物体，松开 v 键后将开始识别"
     )
     # 达到长按阈值并开始从麦克风采集时的提示。
+
+    voice_record_after_enter_tts: bool = True
+    # 为 True 时：先播完上述提示再开始录音，避免扬声器回灌进 ASR。为 False 时恢复旧行为（先录音再播）。
+
+    voice_after_enter_tts_delay_sec: float = 0.25
+    # 提示播完后到开麦前的短延迟（秒），减轻房间混响尾音被录入。
 
     voice_invalid_speech_message: str = "未检测到有效语音指令，请重新长按 v 键再说一次"
     # 松开 v 后音频过短、过静或识别/解析无效时的提示。
@@ -577,12 +589,13 @@ class AudioConfig:
 
     asr_tts_echo_strip_phrases: List[str] = field(
         default_factory=lambda: [
-            "正在录音",
-            "请给出描述",
             "已进入语音输入",
             "请说出要寻找的物体",
+            "请说出要找的物体",
             "松开v键后将开始识别",
             "松开 v 键后将开始识别",
+            "松开微键后将开始识别",
+            "松开微键后",
             "语音录入结束正在识别",
             "语音录入结束，正在识别",
             "正在识别",
@@ -716,6 +729,12 @@ class LoggingConfig:
     #       才正式激活任务（开始计时与指标采集）。
     # 推荐: 4.0 秒，过滤误检和短暂扫过。
 
+    task_target_search_timeout_sec: float = 30.0
+    # 未进入 running 前的「寻找/确认目标」阶段超时（秒）。
+    # 效果: 从进入该阶段起算（与内部搜索阶段计时对齐），若超过此时间仍未激活任务，
+    #       则放弃挂起任务、清空搜索反馈并回到 idle。设为 0 或负数表示不启用超时。
+    # 推荐: 30.0 秒。
+
     task_lost_target_window_sec: float = 4.0
     # 目标丢失判定时间窗口（秒）。
     # 效果: 目标连续消失超过此秒数后，判定为目标丢失并终止任务。
@@ -780,7 +799,7 @@ class SystemConfig:
     # 格式: 使用英文名词短语，如 "a cup", "a bottle", "a person"。
     # 注意: 此值可在运行时被 core/system.py 动态修改。
 
-    camera_id: int = 0
+    camera_id: int = 1
     # 摄像头设备 ID。
     # 效果: 对应系统摄像头编号，0 为默认摄像头，多摄像头时可设为 1、2 等。
     # 推荐: 单摄像头环境保持 0；外接多个摄像头时再改为 1、2…

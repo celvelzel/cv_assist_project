@@ -404,20 +404,54 @@ class CVAssistSystem:
             self._suppress_guidance_until_ts = max(self._suppress_guidance_until_ts, time.time() + duration)
 
     def _speak_priority_message(self, text: str, block: bool = False):
-        """优先播报重要语音反馈，打断旧队列并短时抑制普通引导。"""
+        """优先播报重要语音反馈：清空队列并立即播放，短时抑制普通引导。
+
+        使用 TTS.speak_interrupt（MiMo 为同步合成播放，不走异步队列）。
+        在后台线程执行，避免阻塞主循环（摄像头采集与界面）。
+        """
         if not self.tts_engine or not text or not text.strip():
             return
 
-        self.tts_engine.stop()
-        self.tts_engine.clear_queue()
         self._suppress_guidance_temporarily()
-        self.tts_engine.speak(text.strip(), block=block)
+        text_stripped = text.strip()
+
+        def _runner():
+            try:
+                self.tts_engine.speak_interrupt(text_stripped)
+            except Exception as e:
+                logger.error("优先语音播报失败: %s", e, exc_info=True)
+
+        threading.Thread(target=_runner, daemon=True, name="tts-priority").start()
+
+    def _speak_interrupt_wait_sync(self, text: str) -> None:
+        """在后台线程执行 speak_interrupt，主线程阻塞直到播完。用于先播「已进入语音输入」再开麦。"""
+        if not self.tts_engine or not text or not text.strip():
+            return
+        self._suppress_guidance_temporarily()
+        text_stripped = text.strip()
+        done = threading.Event()
+        err_holder: list = []
+
+        def _runner():
+            try:
+                self.tts_engine.speak_interrupt(text_stripped)
+            except Exception as e:
+                err_holder.append(e)
+                logger.error("同步抢占语音播报失败: %s", e, exc_info=True)
+            finally:
+                done.set()
+
+        threading.Thread(target=_runner, daemon=True, name="tts-enter-sync").start()
+        if not done.wait(timeout=90.0):
+            logger.warning("进入语音提示播报超时，仍将尝试开始录音")
+        if err_holder:
+            return
 
     def _speak_lifecycle_message(self, text: str):
         """播报任务生命周期提示（开始/结束/完成），在独立线程中阻塞播完，不阻塞主循环。
 
         行为约束：
-        - 不清空队列、不打断当前正在播放的内容
+        - 生命周期独占播报由子线程执行；_lifecycle_speaking 在子线程即将 speak_lifecycle 时置位
         - 播报期间延长引导抑制窗口，避免普通指令立即插入
         - 通过 _lifecycle_tts_lock 保证同时只有一条生命周期播报在执行
         """
@@ -435,13 +469,12 @@ class CVAssistSystem:
         )
 
         text_stripped = text.strip()
-        # 主线程立即置位，让 _should_speak_guidance 在子线程合成期间就停止播报
-        self._lifecycle_speaking = True
 
         def _worker():
             if not self._lifecycle_tts_lock.acquire(blocking=False):
                 self._lifecycle_tts_lock.acquire()
             try:
+                # 仅在独占播报真正开始前置位，避免主线程过早置位导致「暂未找到」等串行反馈整段被丢弃
                 self._lifecycle_speaking = True
                 self.tts_engine.speak_lifecycle(text_stripped)
             finally:
@@ -452,10 +485,8 @@ class CVAssistSystem:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _speak_serial_feedback(self, text: str, block: bool = False):
-        """将搜索结果反馈串行加入 TTS 队列，不打断当前确认播报。"""
+        """将搜索结果反馈加入 TTS 异步队列（不因生命周期播报占位而整段丢弃）。"""
         if not self.tts_engine or not text or not text.strip():
-            return
-        if self._lifecycle_speaking:
             return
 
         self._suppress_guidance_temporarily()
@@ -479,7 +510,7 @@ class CVAssistSystem:
         target = (target or "").strip()
         self._search_feedback_target = target or None
         self._search_feedback_state = "searching" if target else "idle"
-        self._search_phase_start_ts = None
+        self._search_phase_start_ts = time.time() if target else None
         self._target_found_streak = 0
         self._target_missing_streak = 0
         self._target_missing_last_spoken_ts = 0.0
@@ -597,6 +628,60 @@ class CVAssistSystem:
                              self._pending_task["task_id"])
             self._pending_task_target_since_ts = None
 
+    def _speak_search_timeout_abort_message(self, text: str) -> None:
+        """寻找目标超时提示：使用抢占合成播放（与长按 v 等一致），避免生命周期线程内 pygame 播放无声。"""
+        if not self.tts_engine or not text or not text.strip():
+            return
+        text_stripped = text.strip()
+
+        def _run():
+            try:
+                if hasattr(self.tts_engine, "speak_interrupt"):
+                    self.tts_engine.speak_interrupt(text_stripped)
+                else:
+                    self.tts_engine.speak_lifecycle(text_stripped)
+            except Exception as e:
+                logger.error("寻找目标超时播报失败: %s", e, exc_info=True)
+
+        threading.Thread(target=_run, daemon=True, name="tts-search-timeout").start()
+
+    def _maybe_abort_target_search_timeout(self, now: float) -> None:
+        """未进入 running 时，若寻找/确认超过 task_target_search_timeout_sec 则放弃。"""
+        if self.current_task is not None:
+            return
+        timeout = float(self.config.logging.task_target_search_timeout_sec)
+        if timeout <= 0:
+            return
+        if self._search_phase_start_ts is None:
+            return
+        if not self._pending_task and not self._search_feedback_target:
+            return
+        if now - self._search_phase_start_ts < timeout:
+            return
+        tgt = ""
+        if self._pending_task:
+            tgt = (self._pending_task.get("target_query") or "").strip()
+        elif self._search_feedback_target:
+            tgt = self._search_feedback_target.strip()
+        logger.info(
+            "寻找目标超时（%.1fs），已退出: target=%s",
+            timeout,
+            tgt,
+        )
+        self._pending_task = None
+        self._pending_task_target_since_ts = None
+        self.task_state = "idle"
+        self._begin_target_search_feedback("")
+        if self.tts_engine:
+            if tgt:
+                self._speak_search_timeout_abort_message(
+                    f"暂未找到目标主体{tgt}，已停止搜索，请调整位置后重试"
+                )
+            else:
+                self._speak_search_timeout_abort_message(
+                    "长时间未找到目标，已停止搜索"
+                )
+
     def _enqueue_task_report(self, report_dict: Dict, task_id: str, created_at: float) -> Optional[str]:
         """将冻结后的任务报告入队后台写盘。返回写入路径，若无 writer 则 None。"""
         if not self.report_writer:
@@ -684,17 +769,21 @@ class CVAssistSystem:
         if self._target_missing_streak < threshold:
             return
 
+        # 已进入 running 任务后不再播「暂未找到」串行反馈，避免与空间简报/引导矛盾
+        # 且异步入队可能早于同秒内的生命周期简报，日志上像「先未找到后又有方位」。
+        # 未进入 running 的确认/搜索阶段（pending_task、无 current_task）仍正常播报。
+        if self.current_task is not None:
+            return
+
         now = time.time()
         repeat_interval = max(
             5.0,
-            float(getattr(cfg, 'target_missing_repeat_interval_sec', 30.0))
+            float(getattr(cfg, 'target_missing_repeat_interval_sec', 10.0))
         )
-        # 任务进行中只播报一次；未进入任务时按间隔重复播报
-        in_task = self.current_task is not None
+        # 此处仅未 running 任务可达；按间隔重复播报
         first_time = self._search_feedback_state != "missing"
         due_for_repeat = (
-            not in_task
-            and now - self._target_missing_last_spoken_ts >= repeat_interval
+            now - self._target_missing_last_spoken_ts >= repeat_interval
         )
 
         if first_time or due_for_repeat:
@@ -1051,6 +1140,17 @@ class CVAssistSystem:
         long_sec = max(0.05, float(getattr(cfg, "voice_v_long_press_sec", 0.45)))
         if time.monotonic() - self._v_down_monotonic < long_sec:
             return
+
+        self._v_hotkey_capturing = True
+        self._voice_in_progress = True
+
+        after_tts = bool(getattr(cfg, "voice_record_after_enter_tts", True))
+        if self.tts_engine and after_tts:
+            self._speak_interrupt_wait_sync(cfg.voice_v_enter_recording_message)
+            delay_sec = max(0.0, float(getattr(cfg, "voice_after_enter_tts_delay_sec", 0.25)))
+            if delay_sec > 0:
+                time.sleep(delay_sec)
+
         try:
             self.audio_recorder.start_recording()
         except Exception as e:
@@ -1059,10 +1159,11 @@ class CVAssistSystem:
                 self._speak_priority_message("录音启动失败，请重试")
             self._v_physical_down = False
             self._v_down_monotonic = None
+            self._v_hotkey_capturing = False
+            self._voice_in_progress = False
             return
-        self._v_hotkey_capturing = True
-        self._voice_in_progress = True
-        if self.tts_engine:
+
+        if self.tts_engine and not after_tts:
             self._speak_priority_message(cfg.voice_v_enter_recording_message)
 
     def _on_v_hotkey_physical_release(self, up_mono: float):
@@ -1108,17 +1209,41 @@ class CVAssistSystem:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _should_offer_periodic_v_hint(self) -> bool:
+        """仅在非任务、无挂起确认、且未设定检测/搜索目标时，才周期性提示「长按 v」。"""
+        if self.current_task is not None:
+            return False
+        if self._pending_task is not None:
+            return False
+        if (getattr(self, "task_state", None) or "").strip() != "idle":
+            return False
+        tq = [x.strip() for x in (self.config.target_queries or []) if x and str(x).strip()]
+        if tq:
+            return False
+        if (self._search_feedback_target or "").strip():
+            return False
+        return True
+
     def _maybe_periodic_long_v_hint(self, now: float):
         if not self._pynput_voice_hotkey or not self.tts_engine or not self.asr_engine:
             return
         if self._voice_in_progress or self._v_physical_down or self._v_hotkey_capturing:
             return
+        if not self._should_offer_periodic_v_hint():
+            self._next_periodic_v_hint_at = None
+            return
         if self._next_periodic_v_hint_at is None:
+            cfg = self.config.audio
+            self._next_periodic_v_hint_at = now + max(
+                0.0, float(getattr(cfg, "voice_periodic_hint_grace_sec", 8.0))
+            )
             return
         if now < self._next_periodic_v_hint_at:
             return
         cfg = self.config.audio
-        self._speak_serial_feedback(cfg.voice_periodic_hint_text)
+        # 必须用抢占播放：异步入队易被 speak_lifecycle/speak_interrupt 的 clear_queue 取消，
+        # 会出现 INFO 已打印「异步入队」但听不到声的情况。
+        self._speak_priority_message(cfg.voice_periodic_hint_text)
         self._next_periodic_v_hint_at = now + max(
             5.0, float(getattr(cfg, "voice_periodic_hint_interval_sec", 55.0))
         )
@@ -1657,8 +1782,7 @@ class CVAssistSystem:
             else:
                 logger.info("       v - 语音输入短按兼容模式 (ASR 已启用，建议安装 pynput 以支持长按)")
         if self.tts_engine:
-            logger.info(f"TTS 已启用，将自动播放引导指令")
-            self.tts_engine.speak("语音播报已开启")
+            logger.info("TTS 已启用，摄像头就绪后将播放语音提示")
         
         logger.info(f"检测目标: {self.config.target_queries}")
         logger.info(f"摄像头选择: {camera_id}")
@@ -1690,7 +1814,12 @@ class CVAssistSystem:
                 raise RuntimeError(f"摄像头 {camera_id} 无法读取图像")
                 
             logger.info(f"摄像头 {camera_id} 初始化成功，分辨率: {test_frame.shape[1]}x{test_frame.shape[0]}")
-            
+
+            # 摄像头就绪后再播报「语音播报已开启」（长按 v 提示在监听启动后计时，见下）
+            if self.tts_engine:
+                self.tts_engine.speak("语音播报已开启")
+            self._run_loop_started_ts = time.time()
+
         except Exception as e:
             logger.error(f"摄像头初始化失败: {e}", exc_info=True)
             logger.error("请检查：")
@@ -1705,6 +1834,19 @@ class CVAssistSystem:
 
         self._start_v_hotkey_listener()
 
+        # 摄像头已就绪且 pynput 长按 v 监听已启动后，仅在「无明确检测目标」时启动周期性提示计时
+        if (
+            self._run_loop_started_ts is not None
+            and self._pynput_voice_hotkey
+            and self.tts_engine
+            and self.asr_engine
+            and self._should_offer_periodic_v_hint()
+        ):
+            acfg = self.config.audio
+            self._next_periodic_v_hint_at = self._run_loop_started_ts + max(
+                0.0, float(getattr(acfg, "voice_periodic_hint_grace_sec", 8.0))
+            )
+
         show_depth = False   # 是否显示深度图
         frame_counter = 0    # 帧计数器，用于定期输出统计
         exit_reason = None
@@ -1716,7 +1858,11 @@ class CVAssistSystem:
                 if self._run_loop_started_ts is None:
                     self._run_loop_started_ts = time.time()
                     acfg = self.config.audio
-                    if self._pynput_voice_hotkey:
+                    if (
+                        self._pynput_voice_hotkey
+                        and self._next_periodic_v_hint_at is None
+                        and self._should_offer_periodic_v_hint()
+                    ):
                         self._next_periodic_v_hint_at = self._run_loop_started_ts + max(
                             0.0, float(getattr(acfg, "voice_periodic_hint_grace_sec", 8.0))
                         )
@@ -1758,8 +1904,10 @@ class CVAssistSystem:
                 try:
                     result = self.process_frame(frame)
                     frame_counter += 1
+                    now_loop = time.time()
+                    self._maybe_abort_target_search_timeout(now_loop)
                     self._update_target_search_feedback(result.detections)
-                    self._update_pending_task_confirmation(result.detections, time.time())
+                    self._update_pending_task_confirmation(result.detections, now_loop)
 
                     # 更新手部稳定帧计数
                     if result.has_hand:

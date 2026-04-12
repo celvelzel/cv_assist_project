@@ -28,6 +28,11 @@ class _DummyTTS:
     def speak_lifecycle(self, text):
         self.messages.append((text, False))
 
+    def speak_interrupt(self, text):
+        self.stop()
+        self.clear_queue()
+        self.messages.append((text, True))
+
     def clear_queue(self):
         self.clear_calls += 1
 
@@ -124,7 +129,7 @@ class SystemTTSPolicyTests(unittest.TestCase):
 
         with patch("core.system.time.time", return_value=300.0):
             system._speak_priority_message("开始寻找目标主体杯子")
-            self.assertEqual(system.tts_engine.messages[-1], ("开始寻找目标主体杯子", False))
+            self.assertEqual(system.tts_engine.messages[-1], ("开始寻找目标主体杯子", True))
 
         with patch("core.system.time.time", return_value=300.5):
             self.assertFalse(system._should_speak_guidance(moving))
@@ -268,7 +273,7 @@ class SystemTTSPolicyTests(unittest.TestCase):
         self.assertEqual(system.tts_engine.clear_calls, clear_calls)
         self.assertEqual(
             system.tts_engine.messages[-2:],
-            [("开始寻找目标主体杯子", False), ("已找到目标主体杯子", False)]
+            [("开始寻找目标主体杯子", True), ("已找到目标主体杯子", False)]
         )
 
 

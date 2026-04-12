@@ -14,8 +14,9 @@ pyyaml>=6.0
 # system metrics (task summary: CPU / memory / network)
 psutil>=5.9.0
 
-# audio
+# audio / ASR（ASREngine；需安装否则初始化失败）
 faster-whisper>=1.0.0
+# 键盘监听：长按 v 语音触发（core.system；未安装则退化为短按兼容）
 pynput>=1.7.6
 pyttsx3>=2.90
 sounddevice>=0.4.6

@@ -44,6 +44,9 @@ def create_tts(config) -> BaseTTS:
             async_mode=cfg.tts_async,
             max_queue_size=cfg.tts_max_queue_size,
             drop_stale=cfg.tts_drop_stale,
+            lifecycle_wait_playback_idle_sec=getattr(
+                cfg, 'mimo_lifecycle_wait_playback_idle_sec', 4.0
+            ),
         )
     elif provider == 'pyttsx3':
         return Pyttsx3TTS(

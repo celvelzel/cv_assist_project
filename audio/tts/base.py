@@ -56,6 +56,17 @@ class BaseTTS(ABC):
         self.clear_queue()
         self.speak(text, block=True)
 
+    def speak_interrupt(self, text: str) -> None:
+        """
+        抢占播报：清空队列并立即播放本条（长按 v 进入录音等强提示）。
+        MiMo 等子类可覆盖为同步合成播放，避免仍排队异步 worker。
+        """
+        if not text or not text.strip():
+            return
+        self.stop()
+        self.clear_queue()
+        self.speak(text.strip(), block=True)
+
     def stop(self):
         """停止当前播放（默认无操作）"""
 

@@ -11,6 +11,8 @@ import queue
 import tempfile
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import List, Optional
 
 from .base import BaseTTS
 
@@ -76,7 +78,8 @@ class MiMoTTS(BaseTTS):
                  async_mode: bool = True,
                  max_queue_size: int = 1,
                  drop_stale: bool = True,
-                 base_url: str = MIMO_BASE_URL):
+                 base_url: str = MIMO_BASE_URL,
+                 lifecycle_wait_playback_idle_sec: float = 4.0):
         """
         初始化 MiMo TTS 引擎
 
@@ -88,6 +91,7 @@ class MiMoTTS(BaseTTS):
             max_queue_size: 异步队列大小
             drop_stale: 队列满时是否丢弃旧消息保留新消息
             base_url: MiMo API 基础 URL
+            lifecycle_wait_playback_idle_sec: speak_lifecycle 抢占前等待播放空闲的上限（秒）
         """
         if not OPENAI_AVAILABLE:
             raise RuntimeError(
@@ -125,6 +129,9 @@ class MiMoTTS(BaseTTS):
         self.max_queue_size = max(1, int(max_queue_size))
         self.drop_stale = drop_stale
         self._stop_token = object()
+        self._lifecycle_wait_playback_idle_sec = max(
+            0.1, float(lifecycle_wait_playback_idle_sec)
+        )
 
         # 初始化 pygame mixer
         assert pygame is not None
@@ -138,9 +145,14 @@ class MiMoTTS(BaseTTS):
             base_url=self.base_url,
         )
 
-        # 异步队列 + 工作线程
+        # 异步队列 + 工作线程；合成在独立线程池中尽早启动，与上一条音频播放重叠
+        self._synth_executor: Optional[ThreadPoolExecutor] = None
         if self.async_mode:
             self.speech_queue = queue.Queue(maxsize=self.max_queue_size)
+            self._synth_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="mimo_tts_syn",
+            )
             self.worker_thread = threading.Thread(target=self._worker, daemon=True)
             self.worker_thread.start()
 
@@ -201,6 +213,11 @@ class MiMoTTS(BaseTTS):
             logger.error(f"MiMo TTS API 调用失败: {e}", exc_info=True)
             raise
 
+    def _synthesize_message(self, text: str) -> List[bytes]:
+        """整句按 | 分段并逐段合成（在合成线程中执行，可与播放线程重叠）。"""
+        parts = [p.strip() for p in text.split("|") if p.strip()]
+        return [self._synthesize(p) for p in parts]
+
     def _play_audio(self, audio_bytes: bytes):
         """
         播放 WAV 音频字节数据
@@ -243,14 +260,14 @@ class MiMoTTS(BaseTTS):
                     self.speech_queue.task_done()
                     break
 
-                text, done_event = payload
+                fut, done_event = payload
                 try:
                     if self._auth_failed:
+                        if not fut.done():
+                            fut.cancel()
                         continue
-                    parts = [p.strip() for p in text.split('|') if p.strip()]
-                    for part in parts:
-                        logger.debug(f"MiMo TTS 异步播放: '{part}'")
-                        audio_bytes = self._synthesize(part)
+                    audios = fut.result()
+                    for audio_bytes in audios:
                         self._play_audio(audio_bytes)
                 except Exception as e:
                     msg = str(e)
@@ -280,7 +297,8 @@ class MiMoTTS(BaseTTS):
             return
 
         text = text.strip()
-        logger.info(f"MiMo TTS 请求: '{text}'")
+        # INFO 便于与生命周期/抢占播报对齐排查；语音实际在合成+排队后播放，略晚于本行日志。
+        logger.info("MiMo TTS 异步入队: '%s'", text)
 
         try:
             if self.async_mode and not block:
@@ -298,9 +316,13 @@ class MiMoTTS(BaseTTS):
             logger.error(f"MiMo TTS 播放失败: {e}", exc_info=True)
 
     def _enqueue_async(self, text: str, wait: bool = False):
-        """将文本加入异步队列，支持队列满时去旧保新。"""
+        """将文本加入异步队列；入队时即提交云端合成，便于与当前播放重叠。"""
+        if self._synth_executor is None:
+            logger.error("MiMo TTS 合成线程池未初始化")
+            return
         done_event = threading.Event() if wait else None
-        payload = (text, done_event)
+        fut = self._synth_executor.submit(self._synthesize_message, text)
+        payload = (fut, done_event)
         queued = False
 
         try:
@@ -309,6 +331,9 @@ class MiMoTTS(BaseTTS):
         except queue.Full:
             if not self.drop_stale:
                 logger.debug("MiMo TTS 队列已满，保留旧消息，丢弃新消息")
+                fut.cancel()
+                if done_event is not None:
+                    done_event.set()
                 return
 
         if not queued:
@@ -318,6 +343,9 @@ class MiMoTTS(BaseTTS):
                 queued = True
             except queue.Full:
                 logger.debug("MiMo TTS 队列仍然繁忙，丢弃当前消息")
+                fut.cancel()
+                if done_event is not None:
+                    done_event.set()
                 return
 
         if wait and done_event is not None:
@@ -328,13 +356,57 @@ class MiMoTTS(BaseTTS):
         """播放引导指令"""
         self.speak(instruction)
 
+    def _playback_idle(self) -> bool:
+        """队列无未完成项且 pygame 未在播放 music 时视为空闲。"""
+        if getattr(self, "async_mode", False) and hasattr(self, "speech_queue"):
+            if getattr(self.speech_queue, "unfinished_tasks", 0) > 0:
+                return False
+        try:
+            if (
+                PYGAME_AVAILABLE
+                and pygame is not None
+                and pygame.mixer.get_init()
+                and pygame.mixer.music.get_busy()
+            ):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def wait_for_playback_idle(self, timeout_sec: float = 12.0) -> None:
+        """等待异步引导播完再抢占，减少生命周期播报打断「向下移动」等指令。
+
+        超时后仍会执行 stop/clear，避免任务结束流程永久阻塞。
+        """
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while time.monotonic() < deadline:
+            if self._playback_idle():
+                return
+            time.sleep(0.04)
+        logger.debug(
+            "MiMo TTS wait_for_playback_idle: 超时 %.1fs，仍将执行生命周期抢占",
+            timeout_sec,
+        )
+
     def speak_lifecycle(self, text: str):
-        """播报任务生命周期提示，直接合成并独占播放通道，不走队列，不可被打断。"""
+        """播报任务生命周期提示，直接合成并独占播放通道，不走队列。
+
+        会先短暂等待队列中引导语音播完，再 stop/clear，降低与引导 TTS 互相截断。
+        """
         if not text or not text.strip():
+            return
+        if self._auth_failed:
+            if not self._auth_failed_warned:
+                logger.warning("MiMo TTS 已因鉴权失败停用（401）。请修正 MIMO_API_KEY 后重启程序。")
+                self._auth_failed_warned = True
             return
         text = text.strip()
         logger.info(f"MiMo TTS 生命周期播报: '{text}'")
         try:
+            # 避免任务完成/开始时立刻 stop，截断尚未播完的引导句
+            self.wait_for_playback_idle(
+                timeout_sec=self._lifecycle_wait_playback_idle_sec
+            )
             # 停止当前播放并清空队列，确保本条优先
             self.stop()
             self.clear_queue()
@@ -343,6 +415,27 @@ class MiMoTTS(BaseTTS):
             self._play_audio(audio_bytes)
         except Exception as e:
             logger.error(f"MiMo TTS 生命周期播报失败: {e}", exc_info=True)
+
+    def speak_interrupt(self, text: str) -> None:
+        """抢占队列并立刻同步合成播放（不走异步队列），用于长按 v 进入录音等。"""
+        if not text or not text.strip():
+            return
+        if self._auth_failed:
+            if not self._auth_failed_warned:
+                logger.warning("MiMo TTS 已因鉴权失败停用（401）。请修正 MIMO_API_KEY 后重启程序。")
+                self._auth_failed_warned = True
+            return
+        text = text.strip()
+        logger.info(f"MiMo TTS 抢占播报: '{text}'")
+        try:
+            self.stop()
+            self.clear_queue()
+            parts = [p.strip() for p in text.split("|") if p.strip()]
+            for part in parts:
+                audio_bytes = self._synthesize(part)
+                self._play_audio(audio_bytes)
+        except Exception as e:
+            logger.error(f"MiMo TTS 抢占播报失败: {e}", exc_info=True)
 
     def stop(self):
         """停止当前播放"""
@@ -360,7 +453,9 @@ class MiMoTTS(BaseTTS):
                 try:
                     payload = self.speech_queue.get_nowait()
                     if isinstance(payload, tuple) and len(payload) == 2:
-                        _, done_event = payload
+                        first, done_event = payload
+                        if isinstance(first, Future):
+                            first.cancel()
                         if done_event is not None:
                             done_event.set()
                     self.speech_queue.task_done()
@@ -399,6 +494,13 @@ class MiMoTTS(BaseTTS):
                 self.speech_queue.put(self._stop_token)
                 if hasattr(self, 'worker_thread'):
                     self.worker_thread.join(timeout=3.0)
+
+            if self._synth_executor is not None:
+                try:
+                    self._synth_executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    self._synth_executor.shutdown(wait=False)
+                self._synth_executor = None
 
             if PYGAME_AVAILABLE and pygame is not None and pygame.mixer.get_init():
                 pygame.mixer.music.stop()
