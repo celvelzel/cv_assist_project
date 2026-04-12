@@ -46,6 +46,14 @@ except ImportError:
     AUDIO_AVAILABLE = False
     logger.warning("音频模块未安装，ASR/TTS功能将不可用")
 
+try:
+    from pynput import keyboard as _pynput_keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    _pynput_keyboard = None  # type: ignore
+    PYNPUT_AVAILABLE = False
+    logger.warning("pynput 未安装，将无法使用长按 v 触发语音；请运行: pip install pynput")
+
 
 @dataclass
 class FrameResult:
@@ -145,7 +153,7 @@ class CVAssistSystem:
         if AUDIO_AVAILABLE:
             self._init_audio_components()
         elif self.config.audio.enable_asr or self.config.audio.enable_tts:
-            logger.warning("音频模块不可用，请安装依赖: pip install openai-whisper pyttsx3 sounddevice")
+            logger.warning("音频模块不可用，请安装依赖: pip install faster-whisper pyttsx3 sounddevice pynput")
         
         # 初始化计数器和缓存
         self.frame_count = 0        # 已处理的帧数
@@ -255,7 +263,8 @@ class CVAssistSystem:
                 self.asr_engine = ASREngine(
                     model_name=cfg.whisper_model,
                     device=self.config.optimization.device,
-                    language=cfg.asr_language
+                    language=cfg.asr_language,
+                    compute_type=getattr(cfg, "whisper_compute_type", None),
                 )
                 
                 # 初始化录音器
@@ -335,6 +344,16 @@ class CVAssistSystem:
         # 在 _handle_voice_input 中使用
         self._frame_buffer = deque(maxlen=self.config.llm_vision.max_frames_for_vision)
         self._frame_buffer_lock = threading.Lock()  # 保护帧缓冲的线程安全
+
+        # 长按 v（pynput）：物理按键状态与录音门控
+        self._pynput_voice_hotkey = False
+        self._v_hotkey_listener = None
+        self._v_hotkey_queue = queue.Queue()
+        self._v_physical_down = False
+        self._v_down_monotonic: Optional[float] = None
+        self._v_hotkey_capturing = False
+        self._next_periodic_v_hint_at: Optional[float] = None
+        self._run_loop_started_ts: Optional[float] = None
 
     def _init_task_metrics(self):
         """初始化任务监测与异步报告写入。"""
@@ -941,6 +960,169 @@ class CVAssistSystem:
         finally:
             self._voice_in_progress = False
 
+    @staticmethod
+    def _hotkey_is_v_key(key) -> bool:
+        try:
+            ch = getattr(key, "char", None)
+            if ch is not None and isinstance(ch, str) and ch.lower() == "v":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_v_hotkey_press(self, key):
+        if not self._pynput_voice_hotkey or not self.asr_engine or not self.audio_recorder:
+            return
+        if not self._hotkey_is_v_key(key):
+            return
+        if self._v_hotkey_capturing:
+            return
+        try:
+            self._v_hotkey_queue.put(("down", time.monotonic()))
+        except Exception:
+            pass
+
+    def _on_v_hotkey_release(self, key):
+        if not self._pynput_voice_hotkey:
+            return
+        if not self._hotkey_is_v_key(key):
+            return
+        try:
+            self._v_hotkey_queue.put(("up", time.monotonic()))
+        except Exception:
+            pass
+
+    def _start_v_hotkey_listener(self):
+        if not PYNPUT_AVAILABLE or not _pynput_keyboard:
+            return
+        if not self.config.audio.enable_asr or not self.asr_engine or not self.audio_recorder:
+            return
+        if self._v_hotkey_listener is not None:
+            return
+        try:
+            self._v_hotkey_listener = _pynput_keyboard.Listener(
+                on_press=self._on_v_hotkey_press,
+                on_release=self._on_v_hotkey_release,
+            )
+            self._v_hotkey_listener.start()
+            self._pynput_voice_hotkey = True
+            logger.info("已启用 pynput 长按 v 语音触发")
+        except Exception as e:
+            logger.error("启动 pynput 键盘监听失败: %s", e, exc_info=True)
+            self._pynput_voice_hotkey = False
+            self._v_hotkey_listener = None
+
+    def _stop_v_hotkey_listener(self):
+        self._pynput_voice_hotkey = False
+        listener = self._v_hotkey_listener
+        self._v_hotkey_listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+
+    def _drain_v_hotkey_queue(self):
+        if not self._pynput_voice_hotkey:
+            return
+        while True:
+            try:
+                kind, ts = self._v_hotkey_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "down":
+                if self._v_hotkey_capturing:
+                    continue
+                self._v_physical_down = True
+                self._v_down_monotonic = ts
+            elif kind == "up":
+                self._on_v_hotkey_physical_release(ts)
+
+    def _tick_v_long_press_start_recording(self):
+        if not self._pynput_voice_hotkey:
+            return
+        if not self._v_physical_down or self._v_down_monotonic is None:
+            return
+        if self._v_hotkey_capturing:
+            return
+        if self._voice_in_progress:
+            return
+        cfg = self.config.audio
+        long_sec = max(0.05, float(getattr(cfg, "voice_v_long_press_sec", 0.45)))
+        if time.monotonic() - self._v_down_monotonic < long_sec:
+            return
+        try:
+            self.audio_recorder.start_recording()
+        except Exception as e:
+            logger.error("长按 v 后启动录音失败: %s", e, exc_info=True)
+            if self.tts_engine:
+                self._speak_priority_message("录音启动失败，请重试")
+            self._v_physical_down = False
+            self._v_down_monotonic = None
+            return
+        self._v_hotkey_capturing = True
+        self._voice_in_progress = True
+        if self.tts_engine:
+            self._speak_priority_message(cfg.voice_v_enter_recording_message)
+
+    def _on_v_hotkey_physical_release(self, up_mono: float):
+        cfg = self.config.audio
+        long_sec = max(0.05, float(getattr(cfg, "voice_v_long_press_sec", 0.45)))
+        down_mono = self._v_down_monotonic
+        was_capturing = self._v_hotkey_capturing
+        self._v_physical_down = False
+        self._v_down_monotonic = None
+        if down_mono is None:
+            return
+        hold = up_mono - down_mono
+        if not was_capturing:
+            if (
+                hold < long_sec
+                and self.tts_engine
+                and not self._voice_in_progress
+            ):
+                self._speak_priority_message(cfg.voice_v_short_press_message)
+            return
+        self._v_hotkey_capturing = False
+        audio = None
+        try:
+            audio = self.audio_recorder.stop_recording()
+        except Exception as e:
+            logger.error("停止录音失败: %s", e, exc_info=True)
+            audio = None
+        if audio is None:
+            audio = np.array([], dtype=np.float32)
+        self._start_voice_buffer_worker(audio)
+
+    def _start_voice_buffer_worker(self, audio: np.ndarray):
+        def run():
+            try:
+                result = self._handle_voice_input(pre_recorded_audio=audio)
+                if result is not None:
+                    self._voice_result_queue.put(result)
+            except Exception as e:
+                logger.error("后台语音线程失败: %s", e, exc_info=True)
+                self._voice_result_queue.put({"status": "error", "message": "语音识别出错"})
+            finally:
+                self._voice_in_progress = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _maybe_periodic_long_v_hint(self, now: float):
+        if not self._pynput_voice_hotkey or not self.tts_engine or not self.asr_engine:
+            return
+        if self._voice_in_progress or self._v_physical_down or self._v_hotkey_capturing:
+            return
+        if self._next_periodic_v_hint_at is None:
+            return
+        if now < self._next_periodic_v_hint_at:
+            return
+        cfg = self.config.audio
+        self._speak_serial_feedback(cfg.voice_periodic_hint_text)
+        self._next_periodic_v_hint_at = now + max(
+            5.0, float(getattr(cfg, "voice_periodic_hint_interval_sec", 55.0))
+        )
+
     def _drain_voice_results(self):
         """消费后台语音结果并在主线程提交状态更新。"""
         while not self._voice_result_queue.empty():
@@ -1196,80 +1378,133 @@ class CVAssistSystem:
         
         return output
     
-    def _handle_voice_input(self):
+    def _handle_voice_input(self, pre_recorded_audio: Optional[np.ndarray] = None):
         """
         处理语音输入
-        
-        录制用户语音，使用 ASR 转录并解析目标。
+
+        录制用户语音（或由长按 v 预先采集的缓冲区），使用 ASR 转录并解析目标。
         返回结构化结果，由主线程统一提交状态更新。
         """
         total_start = time.perf_counter()
-        voice_tts_prompt_ms = None
-        voice_record_ms = None
+        voice_tts_prompt_ms: Optional[float] = None
+        voice_record_ms: Optional[float] = None
+        cfg = self.config.audio
         try:
-            if self.tts_engine:
-                t_prompt = time.perf_counter()
-                self._play_voice_prompt_and_wait("正在录音，请给出描述")
-                voice_tts_prompt_ms = (time.perf_counter() - t_prompt) * 1000.0
-            logger.info("=== 开始语音录制 ===")
-
-            cfg = self.config.audio
-            rec_t0 = time.perf_counter()
-            if cfg.auto_detect_silence:
-                logger.info(f"录音中... (自动检测静音，最长 {cfg.record_duration}s)")
-                audio = self.audio_recorder.record_until_silence(
-                    max_duration=cfg.record_duration,
-                    silence_threshold=cfg.silence_threshold,
-                    silence_duration=cfg.silence_duration
-                )
+            if pre_recorded_audio is not None:
+                logger.info("=== 处理长按 v 采集的语音缓冲区 ===")
+                audio = pre_recorded_audio
+                if not isinstance(audio, np.ndarray) or audio.size == 0:
+                    logger.warning("缓冲区无有效音频")
+                    return {
+                        "status": "error",
+                        "message": cfg.voice_invalid_speech_message,
+                        "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                        "voice_asr_time_ms": 0.0,
+                        "raw_text": "",
+                        "voice_record_ms": None,
+                        "voice_tts_prompt_ms": None,
+                        "llm_poe_ms": None,
+                        "llm_poe_invoked": False,
+                    }
+                sr = float(cfg.record_sample_rate)
+                dur_sec = float(len(audio)) / sr if sr > 0 else 0.0
+                audio_f = audio.astype(np.float32, copy=False)
+                rms = float(np.sqrt(np.mean(np.square(audio_f)))) if audio_f.size else 0.0
+                if dur_sec < float(getattr(cfg, "voice_min_capture_sec", 0.12)):
+                    logger.warning("有效录音过短: %.3fs", dur_sec)
+                    return {
+                        "status": "error",
+                        "message": cfg.voice_invalid_speech_message,
+                        "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                        "voice_asr_time_ms": 0.0,
+                        "raw_text": "",
+                        "voice_record_ms": None,
+                        "voice_tts_prompt_ms": None,
+                        "llm_poe_ms": None,
+                        "llm_poe_invoked": False,
+                    }
+                if rms < float(getattr(cfg, "voice_min_capture_rms", 0.004)):
+                    logger.warning("波形 RMS 过低，疑似静音: rms=%.5f", rms)
+                    return {
+                        "status": "error",
+                        "message": cfg.voice_invalid_speech_message,
+                        "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                        "voice_asr_time_ms": 0.0,
+                        "raw_text": "",
+                        "voice_record_ms": None,
+                        "voice_tts_prompt_ms": None,
+                        "llm_poe_ms": None,
+                        "llm_poe_invoked": False,
+                    }
             else:
-                logger.info(f"录音中... ({cfg.record_duration}s)")
-                audio = self.audio_recorder.record(cfg.record_duration)
-            voice_record_ms = (time.perf_counter() - rec_t0) * 1000.0
-            
-            if len(audio) == 0:
-                logger.warning("未录制到音频")
-                return {
-                    'status': 'error',
-                    'message': '未录制到音频，请重试',
-                    'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
-                    'voice_asr_time_ms': 0.0,
-                    'raw_text': '',
-                    'voice_record_ms': voice_record_ms,
-                    'voice_tts_prompt_ms': voice_tts_prompt_ms,
-                    'llm_poe_ms': None,
-                    'llm_poe_invoked': False,
-                }
-            
-            logger.info(f"录音完成，开始识别...")
+                if self.tts_engine:
+                    t_prompt = time.perf_counter()
+                    self._play_voice_prompt_and_wait("正在录音，请给出描述")
+                    voice_tts_prompt_ms = (time.perf_counter() - t_prompt) * 1000.0
+                logger.info("=== 开始语音录制 ===")
+                rec_t0 = time.perf_counter()
+                if cfg.auto_detect_silence:
+                    logger.info(
+                        "录音中... (自动检测静音，最长 %ss)", cfg.record_duration
+                    )
+                    audio = self.audio_recorder.record_until_silence(
+                        max_duration=cfg.record_duration,
+                        silence_threshold=cfg.silence_threshold,
+                        silence_duration=cfg.silence_duration,
+                    )
+                else:
+                    logger.info("录音中... (%ss)", cfg.record_duration)
+                    audio = self.audio_recorder.record(cfg.record_duration)
+                voice_record_ms = (time.perf_counter() - rec_t0) * 1000.0
+
+                if len(audio) == 0:
+                    logger.warning("未录制到音频")
+                    return {
+                        "status": "error",
+                        "message": "未录制到音频，请重试",
+                        "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                        "voice_asr_time_ms": 0.0,
+                        "raw_text": "",
+                        "voice_record_ms": voice_record_ms,
+                        "voice_tts_prompt_ms": voice_tts_prompt_ms,
+                        "llm_poe_ms": None,
+                        "llm_poe_invoked": False,
+                    }
+
+            logger.info("录音完成，开始识别...")
             if self.tts_engine:
-                if getattr(cfg, 'voice_feedback_after_recording', True):
+                if getattr(cfg, "voice_feedback_after_recording", True):
                     self._speak_priority_message("语音录入结束，正在识别")
                 else:
                     self.tts_engine.speak("正在识别")
-            
-            # 语音识别（初步识别：Whisper ASR，耗时见 asr_time_ms / 日志 asr_ms）
+
             asr_start = time.perf_counter()
             result = self.asr_engine.transcribe_audio(audio, cfg.record_sample_rate)
             voice_asr_time_ms = float(result.get("asr_time_ms") or 0.0)
             if voice_asr_time_ms <= 0.0:
                 voice_asr_time_ms = (time.perf_counter() - asr_start) * 1000.0
-            text = result.get('text', '').strip()
-            
+            text = result.get("text", "").strip()
+            phrases = getattr(cfg, "asr_tts_echo_strip_phrases", None)
+            text = ASREngine.strip_tts_echo_phrases(text, phrases)
+
             if not text:
-                logger.warning("识别结果为空")
+                logger.warning("识别结果为空（含 TTS 回声剔除后）")
                 return {
-                    'status': 'error',
-                    'message': '没有识别到内容，请重试',
-                    'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
-                    'voice_asr_time_ms': voice_asr_time_ms,
-                    'raw_text': '',
-                    'voice_record_ms': voice_record_ms,
-                    'voice_tts_prompt_ms': voice_tts_prompt_ms,
-                    'llm_poe_ms': None,
-                    'llm_poe_invoked': False,
+                    "status": "error",
+                    "message": (
+                        cfg.voice_invalid_speech_message
+                        if pre_recorded_audio is not None
+                        else "没有识别到内容，请重试"
+                    ),
+                    "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                    "voice_asr_time_ms": voice_asr_time_ms,
+                    "raw_text": "",
+                    "voice_record_ms": voice_record_ms,
+                    "voice_tts_prompt_ms": voice_tts_prompt_ms,
+                    "llm_poe_ms": None,
+                    "llm_poe_invoked": False,
                 }
-            
+
             logger.info(
                 "识别结果: '%s' | 初步识别 asr_ms=%.0fms",
                 text,
@@ -1303,28 +1538,35 @@ class CVAssistSystem:
             if 'llm_poe_invoked' not in voice_event:
                 voice_event['llm_poe_invoked'] = False
 
-            if voice_event.get('status') == 'ok':
+            if (
+                pre_recorded_audio is not None
+                and voice_event.get("status") == "error"
+                and voice_event.get("action") != "user_voice_exit"
+            ):
+                voice_event["message"] = cfg.voice_invalid_speech_message
+
+            if voice_event.get("status") == "ok":
                 logger.info(
                     "语音事件解析成功: action=%s target=%s",
-                    voice_event.get('action'),
-                    voice_event.get('target'),
+                    voice_event.get("action"),
+                    voice_event.get("target"),
                 )
             else:
-                logger.warning(f"无法解析指令: '{text}'")
+                logger.warning("无法解析指令: '%s'", text)
             return voice_event
-            
+
         except Exception as e:
-            logger.error(f"语音输入处理失败: {e}", exc_info=True)
+            logger.error("语音输入处理失败: %s", e, exc_info=True)
             return {
-                'status': 'error',
-                'message': '语音识别出错',
-                'voice_total_time_ms': (time.perf_counter() - total_start) * 1000,
-                'voice_asr_time_ms': 0.0,
-                'raw_text': '',
-                'voice_record_ms': None,
-                'voice_tts_prompt_ms': None,
-                'llm_poe_ms': None,
-                'llm_poe_invoked': False,
+                "status": "error",
+                "message": "语音识别出错",
+                "voice_total_time_ms": (time.perf_counter() - total_start) * 1000,
+                "voice_asr_time_ms": 0.0,
+                "raw_text": "",
+                "voice_record_ms": None,
+                "voice_tts_prompt_ms": None,
+                "llm_poe_ms": None,
+                "llm_poe_invoked": False,
             }
 
     def _build_frame_metrics(
@@ -1395,7 +1637,7 @@ class CVAssistSystem:
         控制键:
         - 'q': 退出程序
         - 'd': 切换深度图显示
-        - 'v': 开始语音输入 (如果启用了ASR)
+        - 'v': 语音输入（默认：长按 v；若 pynput 不可用则短按 v 走兼容流程）
         
         参数:
             camera_id: 摄像头 ID，未传入时使用配置文件中的 camera.id
@@ -1407,7 +1649,13 @@ class CVAssistSystem:
         logger.info(f"控制: q - 退出, d - 切换深度显示")
         
         if self.asr_engine:
-            logger.info(f"       v - 语音输入 (ASR 已启用)")
+            if PYNPUT_AVAILABLE:
+                logger.info(
+                    "       语音输入: 长按 v 键（约 %.2fs）后说话，松开后识别",
+                    float(getattr(self.config.audio, "voice_v_long_press_sec", 0.45)),
+                )
+            else:
+                logger.info("       v - 语音输入短按兼容模式 (ASR 已启用，建议安装 pynput 以支持长按)")
         if self.tts_engine:
             logger.info(f"TTS 已启用，将自动播放引导指令")
             self.tts_engine.speak("语音播报已开启")
@@ -1454,7 +1702,9 @@ class CVAssistSystem:
 
         window_name = "CV Assist System"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        
+
+        self._start_v_hotkey_listener()
+
         show_depth = False   # 是否显示深度图
         frame_counter = 0    # 帧计数器，用于定期输出统计
         exit_reason = None
@@ -1463,9 +1713,19 @@ class CVAssistSystem:
             logger.info("开始主循环")
             while True:
                 loop_start = time.perf_counter()
+                if self._run_loop_started_ts is None:
+                    self._run_loop_started_ts = time.time()
+                    acfg = self.config.audio
+                    if self._pynput_voice_hotkey:
+                        self._next_periodic_v_hint_at = self._run_loop_started_ts + max(
+                            0.0, float(getattr(acfg, "voice_periodic_hint_grace_sec", 8.0))
+                        )
 
                 # 主线程提交后台语音识别结果
                 self._drain_voice_results()
+                self._drain_v_hotkey_queue()
+                self._tick_v_long_press_start_recording()
+                self._maybe_periodic_long_v_hint(time.time())
 
                 # 读取摄像头帧
                 capture_start = time.perf_counter()
@@ -1587,10 +1847,12 @@ class CVAssistSystem:
                 elif key == ord('d'):
                     show_depth = not show_depth
                     logger.info(f"深度显示: {'开启' if show_depth else '关闭'}")
-                elif key == ord('v'):
-                    # 语音输入
+                elif key == ord("v"):
                     if self.asr_engine and self.audio_recorder:
-                        self._start_voice_input_async()
+                        if self._pynput_voice_hotkey:
+                            logger.debug("已启用 pynput 长按 v，忽略 OpenCV 窗口内的单次 v 键")
+                        else:
+                            self._start_voice_input_async()
                     else:
                         logger.warning("ASR 功能未启用")
 
@@ -1643,6 +1905,13 @@ class CVAssistSystem:
             logger.exception(f"运行过程中发生异常: {e}")
             exit_reason = 'error'
         finally:
+            if self._v_hotkey_capturing and self.audio_recorder:
+                try:
+                    self.audio_recorder.stop_recording()
+                except Exception:
+                    pass
+                self._v_hotkey_capturing = False
+            self._stop_v_hotkey_listener()
             if exit_reason:
                 logger.info("本次运行退出原因: %s", exit_reason)
             if self.current_task:

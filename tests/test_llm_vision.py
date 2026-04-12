@@ -225,20 +225,20 @@ class TestLLMVisionIntegration:
     
     def test_asr_parse_command_with_vision_no_llm(self):
         """Test ASREngine.parse_command_with_vision without LLM"""
-        # Skip Whisper initialization by mocking
-        with patch('audio.asr.whisper'):
-            asr = ASREngine(model_name="base")
-            frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
-            
-            target, poe_ms, invoked = asr.parse_command_with_vision(
-                "找到手机",
-                frames=frames,
-                llm_parser=None
-            )
+        # 不加载 Whisper 模型，仅测解析路径
+        asr = ASREngine.__new__(ASREngine)
+        asr.language = "zh,en"
+        frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
 
-            assert target is not None
-            assert poe_ms is None
-            assert invoked is False
+        target, poe_ms, invoked = asr.parse_command_with_vision(
+            "找到手机",
+            frames=frames,
+            llm_parser=None,
+        )
+
+        assert target is not None
+        assert poe_ms is None
+        assert invoked is False
     
     def test_create_llm_vision_parser_no_key(self):
         """Test factory function without API key"""

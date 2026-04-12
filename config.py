@@ -20,7 +20,7 @@ import os
 import sys
 import logging
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import List, Tuple, Dict, Any, Type, get_type_hints
+from typing import List, Tuple, Dict, Any, Type, get_type_hints, Optional
 from pathlib import Path
 
 try:
@@ -332,12 +332,14 @@ class AudioConfig:
     # 注意: 启用后需安装 whisper 相关依赖。
 
     whisper_model: str = "medium"
-    # Whisper 语音识别模型大小。
-    # 可选值: "tiny" (最快), "base" (推荐), "small", "medium", "large" (最准)
+    # faster-whisper / CTranslate2 模型大小（与 OpenAI Whisper 权重名基本一致）。
+    # 可选值: "tiny", "base", "small", "medium", "large-v2", "large-v3" 等
     # 效果: 模型越大识别准确率越高，但内存占用和推理时间也越大。
-    #       tiny: ~1GB RAM, base: ~1.5GB, medium: ~5GB, large: ~10GB
     # 推荐: "base" 在中文场景下表现良好且资源占用适中。
-    #       中文识别质量要求高时使用 "medium"。
+
+    whisper_compute_type: Optional[str] = None
+    # faster-whisper compute_type；None 时由 ASREngine 按设备默认
+    # （CUDA 上 float16，CPU 上 int8）。
 
     asr_language: str = "zh,en"
     # Whisper 识别的目标语言。
@@ -541,6 +543,59 @@ class AudioConfig:
     # 语音交互后抑制引导播报的时间（秒）。
     # 效果: 用户进行语音操作后，在此时间内系统暂停空间引导播报，
     #       避免语音重叠。
+
+    # ---- 长按 v 语音触发（需 pynput 监听物理按键）----
+
+    voice_v_long_press_sec: float = 0.45
+    # 按住 v 达到该秒数后视为「长按」，开始录音并播报已进入语音输入。
+
+    voice_periodic_hint_grace_sec: float = 8.0
+    # 启动主循环后延迟多久再开始周期性长按提示（秒）。
+
+    voice_periodic_hint_interval_sec: float = 55.0
+    # 周期性提示「请长按 v…」的最小间隔（秒）。
+
+    voice_periodic_hint_text: str = "请长按 v 键进入物体识别"
+    # 启动后周期性语音提示文案。
+
+    voice_v_short_press_message: str = "请长按 v 键进入语音输入，当前操作不规范"
+    # 按下 v 但未达到长按阈值即松开时的提示。
+
+    voice_v_enter_recording_message: str = (
+        "已进入语音输入，请说出要寻找的物体，松开 v 键后将开始识别"
+    )
+    # 达到长按阈值并开始从麦克风采集时的提示。
+
+    voice_invalid_speech_message: str = "未检测到有效语音指令，请重新长按 v 键再说一次"
+    # 松开 v 后音频过短、过静或识别/解析无效时的提示。
+
+    voice_min_capture_sec: float = 0.12
+    # 长按触发后，松开 v 时若有效音频时长低于该值则视为无效语音（秒）。
+
+    voice_min_capture_rms: float = 0.004
+    # 松开 v 后若整段波形 RMS 低于该阈值则视为无效语音（归一化 float32）。
+
+    asr_tts_echo_strip_phrases: List[str] = field(
+        default_factory=lambda: [
+            "正在录音",
+            "请给出描述",
+            "已进入语音输入",
+            "请说出要寻找的物体",
+            "松开v键后将开始识别",
+            "松开 v 键后将开始识别",
+            "语音录入结束正在识别",
+            "语音录入结束，正在识别",
+            "正在识别",
+            "请长按v键进入物体识别",
+            "请长按 v 键进入物体识别",
+            "请长按v键进入语音输入",
+            "请长按 v 键进入语音输入",
+            "请长按 v 键进入语音输入当前操作不规范",
+            "请长按v键进入语音输入当前操作不规范",
+            "语音播报已开启",
+        ]
+    )
+    # ASR 识别结果中按子串剔除的短语（用于屏蔽 TTS 回灌到麦克风的文本）。
 
 
 @dataclass
