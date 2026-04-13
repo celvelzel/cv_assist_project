@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,14 @@ class _DummyTTS:
     def speak_instruction(self, text):
         self.messages.append((text, False))
 
+    def speak_lifecycle(self, text):
+        self.messages.append((text, False))
+
+    def speak_interrupt(self, text):
+        self.stop()
+        self.clear_queue()
+        self.messages.append((text, True))
+
     def clear_queue(self):
         self.clear_calls += 1
 
@@ -38,6 +47,7 @@ class SystemTTSPolicyTests(unittest.TestCase):
             logging=SimpleNamespace(
                 enable_task_metrics=True,
                 task_metrics_interval_sec=1.0,
+                task_start_confirm_window_sec=0.5,
             ),
             audio=SimpleNamespace(
                 tts_instruction_interval_sec=3.0,
@@ -63,6 +73,11 @@ class SystemTTSPolicyTests(unittest.TestCase):
         system._voice_in_progress = False
         system._voice_prompt_playing = False
         system._suppress_guidance_until_ts = 0.0
+        system._proximity_beep = None
+        system._pending_task = None
+        system._pending_task_target_since_ts = None
+        system._lifecycle_speaking = False
+        system._lifecycle_tts_lock = threading.Lock()
         system._search_feedback_target = None
         system._search_feedback_state = "idle"
         system._target_missing_streak = 0
@@ -73,11 +88,12 @@ class SystemTTSPolicyTests(unittest.TestCase):
         system._task_index = 0
         system._last_task_summary_ts = 0.0
         system._requested_shutdown = False
+        system._last_under_suppress = False
         system.report_writer = None
         system.task_metrics_collector = TaskMetricsCollector(
             grasp_stable_frames=3,
             ready_confirm_window_sec=1.5,
-            lost_target_frame_threshold=5,
+            lost_target_window_sec=5.0,
         )
         return system
 
@@ -113,7 +129,7 @@ class SystemTTSPolicyTests(unittest.TestCase):
 
         with patch("core.system.time.time", return_value=300.0):
             system._speak_priority_message("开始寻找目标主体杯子")
-            self.assertEqual(system.tts_engine.messages[-1], ("开始寻找目标主体杯子", False))
+            self.assertEqual(system.tts_engine.messages[-1], ("开始寻找目标主体杯子", True))
 
         with patch("core.system.time.time", return_value=300.5):
             self.assertFalse(system._should_speak_guidance(moving))
@@ -157,7 +173,8 @@ class SystemTTSPolicyTests(unittest.TestCase):
             system._drain_voice_results()
 
         self.assertEqual(system.config.target_queries, ["杯子"])
-        self.assertIsNotNone(system.current_task)
+        self.assertIsNotNone(system._pending_task)
+        self.assertEqual(system._pending_task["target_query"], "杯子")
         self.assertEqual(system._search_feedback_target, "杯子")
         self.assertEqual(system._search_feedback_state, "searching")
         self.assertEqual(system.tts_engine.messages[-1], ("开始寻找目标主体杯子", False))
@@ -180,7 +197,10 @@ class SystemTTSPolicyTests(unittest.TestCase):
 
         self.assertTrue(system._requested_shutdown)
         self.assertIsNone(system.current_task)
-        self.assertEqual(system.tts_engine.messages[-1], ("正在退出程序", False))
+        self.assertEqual(
+            system.tts_engine.messages[-1],
+            ("任务终止，语音退出杯子", False),
+        )
 
     def test_drain_voice_results_switches_target_and_restarts_task(self):
         system = self._build_system_stub()
@@ -201,8 +221,8 @@ class SystemTTSPolicyTests(unittest.TestCase):
         with patch("core.system.time.time", return_value=420.0):
             system._drain_voice_results()
 
-        self.assertIsNotNone(system.current_task)
-        self.assertEqual(system.current_task["target_query"], "瓶子")
+        self.assertIsNotNone(system._pending_task)
+        self.assertEqual(system._pending_task["target_query"], "瓶子")
         self.assertEqual(system.config.target_queries, ["瓶子"])
         self.assertEqual(system.tts_engine.messages[-1], ("原任务结束，切换至目标主体瓶子", False))
 
@@ -253,7 +273,7 @@ class SystemTTSPolicyTests(unittest.TestCase):
         self.assertEqual(system.tts_engine.clear_calls, clear_calls)
         self.assertEqual(
             system.tts_engine.messages[-2:],
-            [("开始寻找目标主体杯子", False), ("已找到目标主体杯子", False)]
+            [("开始寻找目标主体杯子", True), ("已找到目标主体杯子", False)]
         )
 
 

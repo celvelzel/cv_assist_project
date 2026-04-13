@@ -15,8 +15,9 @@ Flow:
 import logging
 import json
 import base64
+import time
 import numpy as np
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from io import BytesIO
 from pathlib import Path
 
@@ -31,9 +32,12 @@ except ImportError:
 
 try:
     import openai
+    from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+    openai = None  # type: ignore
+    APIConnectionError = APIError = APITimeoutError = RateLimitError = Exception  # type: ignore
     logger.warning("OpenAI client not available, LLM vision disabled")
 
 
@@ -158,48 +162,43 @@ class LLMVisionParser:
         )
         return prompt
     
-    def parse_with_vision(self,
-                         asr_text: str,
-                         frames: List[np.ndarray]) -> Optional[Dict[str, str]]:
+    def parse_with_vision(
+        self,
+        asr_text: str,
+        frames: List[np.ndarray],
+    ) -> Tuple[Optional[Dict[str, str]], Optional[float], bool]:
         """
         Parse ASR text with visual context using LLM.
-        
-        Parameters:
-            asr_text: Recognized text from Whisper ASR
-            frames: List of camera frames (numpy arrays, BGR format)
-            
+
         Returns:
-            Dictionary with 'target' key if successful, None on failure
-            Example: {"target": "phone"}
+            (result_dict_or_None, poe_elapsed_ms_or_None, poe_invoked).
+            poe_invoked is True iff the Poe API path was entered (including failed calls).
         """
         if not self.enabled:
             logger.debug("LLM vision parsing disabled, returning None")
-            return None
-        
+            return None, None, False
+
         if not asr_text or not asr_text.strip():
             logger.warning("Empty ASR text provided to LLM vision parser")
-            return None
-        
+            return None, None, False
+
         if not frames or len(frames) == 0:
             logger.warning("No frames provided to LLM vision parser")
-            return None
-        
-        # Limit frames
+            return None, None, False
+
         frames = frames[:self.max_frames]
         frame_count = len(frames)
-        
+
         logger.debug(f"Parsing with vision: text='{asr_text}', frames={frame_count}")
-        
-        # Build the message with frames
+
         try:
             message_content = [
                 {
                     "type": "text",
-                    "text": self._build_vision_prompt(asr_text, frame_count)
+                    "text": self._build_vision_prompt(asr_text, frame_count),
                 }
             ]
-            
-            # Encode and attach frames as images
+
             for i, frame in enumerate(frames):
                 img_base64 = self.encode_frame_to_base64(frame)
                 if img_base64:
@@ -208,44 +207,39 @@ class LLMVisionParser:
                         "source": {
                             "type": "base64",
                             "media_type": "image/jpeg",
-                            "data": img_base64
-                        }
+                            "data": img_base64,
+                        },
                     })
                     logger.debug(f"Frame {i+1}/{frame_count} encoded")
                 else:
                     logger.warning(f"Failed to encode frame {i+1}")
-            
-            # Call Poe API with retry logic
-            result = self._call_poe_api_with_retry(message_content)
-            
+
+            result, elapsed_ms = self._call_poe_api_with_retry(message_content)
             if result is None:
                 logger.warning("LLM API returned None, falling back to ASR text")
-                return None
-            
-            logger.info(f"LLM parsing result: {result}")
-            return result
-            
+            else:
+                logger.info(f"LLM parsing result: {result}")
+            return result, float(elapsed_ms), True
+
         except Exception as e:
             logger.error(f"LLM vision parsing exception: {e}", exc_info=True)
-            return None
-    
-    def _call_poe_api_with_retry(self, message_content: List[Dict]) -> Optional[Dict]:
+            return None, None, False
+
+    def _call_poe_api_with_retry(self, message_content: List[Dict]) -> Tuple[Optional[Dict], float]:
         """
         Call Poe API with automatic retry and JSON parsing.
-        
-        Parameters:
-            message_content: Message content list with text and images
-            
+
         Returns:
-            Parsed JSON response {"target": "..."} or None on failure
+            (Parsed JSON response or None, elapsed_ms for entire call including retries)
         """
+        t0 = time.perf_counter()
         attempt = 0
         while attempt <= self.retry_count:
             try:
                 logger.debug(
                     f"Calling Poe API (attempt {attempt + 1}/{self.retry_count + 1})"
                 )
-                
+
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -265,18 +259,18 @@ class LLMVisionParser:
                 # Parse JSON response
                 result = self._parse_json_response(response_text)
                 if result:
-                    return result
-                
-            except openai.APIConnectionError as e:
+                    return result, (time.perf_counter() - t0) * 1000.0
+
+            except APIConnectionError as e:
                 logger.error(f"API connection error: {e}")
                 attempt += 1
-            except openai.APITimeoutError as e:
+            except APITimeoutError as e:
                 logger.error(f"API timeout: {e}")
                 attempt += 1
-            except openai.RateLimitError as e:
+            except RateLimitError as e:
                 logger.error(f"API rate limit exceeded: {e}")
-                return None  # Don't retry on rate limit
-            except openai.APIError as e:
+                return None, (time.perf_counter() - t0) * 1000.0
+            except APIError as e:
                 logger.error(f"API error: {e}")
                 attempt += 1
             except Exception as e:
@@ -284,7 +278,7 @@ class LLMVisionParser:
                 attempt += 1
         
         logger.warning("LLM API call failed after retries")
-        return None
+        return None, (time.perf_counter() - t0) * 1000.0
     
     def _parse_json_response(self, response_text: str) -> Optional[Dict[str, str]]:
         """

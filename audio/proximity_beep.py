@@ -40,16 +40,26 @@ class ProximityBeepPlayer:
         self._stream_stop = False
         self._stream_thread: Optional[threading.Thread] = None
 
+    @staticmethod
+    def _stop_sounddevice_playback() -> None:
+        """仅从 proximity-beep 工作线程调用：停止 play() 创建的流。
+
+        主线程在另一线程 sd.play(blocking=True) 期间调用 sd.stop() 会在 Windows 上触发
+        PortAudio 访问冲突；停止请求只通过 _cont_eligible / _stream_stop 标志传达，
+        由工作线程执行 stop。
+        """
+        if not SOUNDDEVICE_AVAILABLE:
+            return
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
     def set_continuous_eligible(self, v: bool) -> None:
         with self._lock:
             self._cont_eligible = bool(v)
             if not v:
                 self._cont_snap = {}
-        if not v and SOUNDDEVICE_AVAILABLE:
-            try:
-                sd.stop()
-            except Exception:
-                pass
 
     def reset_cooldown(self) -> None:
         self._last_beep_ts = 0.0
@@ -85,7 +95,25 @@ class ProximityBeepPlayer:
                         volume=float(snap.get("volume", 0.55)),
                     )
                     sr = int(snap["sample_rate"])
-                    sd.play(wave, sr, blocking=True)
+                    # 非阻塞 play + 在本线程内轮询停止，避免主线程 sd.stop 与 blocking play 并发崩溃
+                    sd.play(wave, sr, blocking=False)
+                    chunk_dur = float(len(wave)) / float(sr)
+                    t0 = time.perf_counter()
+                    while True:
+                        if self._stream_stop:
+                            self._stop_sounddevice_playback()
+                            break
+                        with self._lock:
+                            if not self._cont_eligible:
+                                self._stop_sounddevice_playback()
+                                break
+                        if time.perf_counter() - t0 >= max(0.0, chunk_dur - 0.02):
+                            try:
+                                sd.wait()
+                            except Exception:
+                                pass
+                            break
+                        time.sleep(0.015)
                 except Exception as e:
                     logger.debug("proximity_beep 连续播放段失败: %s", e)
                     time.sleep(0.05)
