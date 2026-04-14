@@ -46,11 +46,11 @@ Our hand tracking runs smoothly at a high frequency of 30 Hz. However, the objec
 **Slide 7: Voice Interaction & LLM Correction – [Deep Dive / Highlight]**
 *Duration: 1 minute*
 
-Our most exciting feature is the LLM-Assisted Keyword Extraction for error correction. In a noisy room, speech recognition may mishear a command, for example turning "find the cup" into "find the mop." When that happens, our system sends both the transcribed text and the four most recent camera frames to an LLM. With that visual context, the model can identify the cup and correct the command. This multimodal design makes the system tightly aligns with true user intent.
+Our most exciting feature is the LLM-Assisted Keyword Extraction for error correction. In a noisy room, speech recognition may mishear a command, for example turning "find the cup" into "find the mop." When that happens, our system sends both the transcribed text and the four most recent camera frames to a multimodal large language model. With that visual context, the model can correct the command. This multimodal design makes the system tightly aligns with true user intent.
 
 [Click for Next Slide]
 
 **Slide 8: Dual-Threshold Logic – [Deep Dive]**
 *Duration: 55 seconds*
 
-Let us now look at the decision algorithm. Real-time guidance often suffers from instruction jitter, where directions rapidly flip between left and right. To solve this, we implemented a dual-threshold hysteresis strategy.  We established two distinct boundaries to trigger a new directional instruction. This keeps the audio instructions stable and consistent.
+Let us now look at the decision algorithm. Real-time guidance often suffers from instruction jitter, where directions rapidly flip between left and right. To solve this, we designed a Dual-Threshold hysteresis strategy, which is similar to a Buffer Zone. Instead of a single strict line, user must move significantly out of the center to trigger a 'left' command. This keeps the audio instructions stable and consistent.

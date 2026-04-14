@@ -72,9 +72,15 @@ A real-time visual assistance system designed to help visually impaired users lo
 - **Real-time depth estimation** — monocular depth via MiDaS for distance-aware guidance
 - **Hand tracking with gesture recognition** — detects open, closed, and pointing gestures
 - **Voice control** — speak to set the target object (Chinese & English supported)
+- **Faster Whisper ASR** — high-performance local speech recognition with `faster-whisper`, including bilingual `zh/en` handling and auto device fallback
+- **Long-press `V` voice input** — press-and-hold `V` behavior for voice capture with echo cancellation and buffering
 - **LLM-assisted voice recognition** — Uses Poe API + deepseek LLM with visual context to correct speech errors and improve accuracy
 - **Speech guidance** — audio instructions guide the user's hand toward the target
+- **Spatial briefing** — spoken spatial summaries using clock-hour direction plus estimated distance (e.g., "3 o'clock, about 0.8 meters")
+- **Proximity beep** — non-blocking audio cues that increase in frequency as the hand gets closer to the target
 - **Hysteresis-based guidance** — prevents oscillation at alignment boundaries
+- **System TTS policy** — strict TTS policy layer for priority prompts, interruptible speech, and guidance suppression during critical announcements
+- **Task metrics & reporting** — per-task metrics collection including frame timing, guidance state, voice timing, and end-of-task summaries
 - **Configurable profiles** — fast / balanced / voice / tts / mimo-tts presets
 - **Modular design** — each detector is independent and easily extensible
 
@@ -443,20 +449,26 @@ cv_assist_project/
 │   ├── asr.py                   # Whisper ASR engine
 │   ├── audio_utils.py           # Audio recording utilities
 │   ├── llm_vision.py            # LLM Vision Parser — Poe API integration for voice correction
+│   ├── proximity_beep.py        # Proximity beep audio generator
 │   └── tts/
 │       ├── base.py              # Abstract TTS interface
 │       ├── pyttsx3_backend.py   # Offline TTS (pyttsx3)
 │       └── mimo_backend.py      # Cloud TTS (Xiaomi MiMo)
 │
 ├── utils/
-│   └── logger.py                # Logging & FPS counter
+│   ├── logger.py                # Logging & FPS counter
+│   └── task_metrics.py          # Task metrics & reporting
 │
 └── tests/
     ├── test_all.py              # Import smoke test
+    ├── test_asr_language_mode.py # ASR language mode test
     ├── test_audio.py            # Audio subsystem tests
+    ├── test_config_loading.py   # Config loading test
     ├── test_guidance.py         # Guidance hysteresis tests
+    ├── test_llm_vision.py       # LLM Vision Parser tests
     ├── test_logging.py          # Logging & FPS tests
-    └── test_llm_vision.py       # LLM Vision Parser tests
+    ├── test_system_tts_policy.py # System TTS policy test
+    └── test_task_metrics.py     # Task metrics tests
 ```
 
 ---
@@ -544,9 +556,15 @@ cv_assist_project/
 - **实时深度估计** — 基于 MiDaS 的单目深度感知，提供距离引导
 - **手部追踪与手势识别** — 检测张开、握拳、指向三种手势
 - **语音控制** — 支持中英文语音输入设定搜索目标
+- **Faster Whisper ASR** — 高性能本地 `faster-whisper` 语音识别，支持中英双语处理及设备自动回退
+- **长按 `V` 语音输入** — 支持按住 `V` 键进行语音捕获，内置回声消除与缓冲机制
 - **LLM 增强语音识别** — 用 Poe API + deepseek LLM + 视觉上下文，纠正语音错误并提高准确度
 - **语音播报引导** — 通过语音指令引导用户将手移向目标
+- **空间简报** — 使用钟表方向和预估距离进行语音空间总结（如“3点方向，约0.8米”）
+- **接近提示音** — 非阻塞音频提示，手越靠近目标频率越高
 - **滞回引导算法** — 防止对齐边界的指令来回跳动
+- **系统 TTS 策略** — 严格的 TTS 策略层，处理优先级播报、可中断语音及关键广播时的引导抑制
+- **任务指标与报告** — 任务级指标收集，包括帧耗时、引导状态、语音耗时及任务总结
 - **可配置预设** — fast / balanced / voice / tts / mimo-tts 五种配置模式
 - **模块化设计** — 各检测器独立，便于扩展
 
@@ -915,20 +933,26 @@ cv_assist_project/
 │   ├── asr.py                   # Whisper 语音识别引擎
 │   ├── audio_utils.py           # 录音工具
 │   ├── llm_vision.py            # LLM 视觉解析器 — Poe API 集成用于语音纠正
+│   ├── proximity_beep.py        # 接近提示音频生成器
 │   └── tts/
 │       ├── base.py              # TTS 抽象接口
 │       ├── pyttsx3_backend.py   # 离线 TTS（pyttsx3）
 │       └── mimo_backend.py      # 云端 TTS（小米 MiMo）
 │
 ├── utils/
-│   └── logger.py                # 日志与 FPS 计数器
+│   ├── logger.py                # 日志与 FPS 计数器
+│   └── task_metrics.py          # 任务指标与报告
 │
 └── tests/
     ├── test_all.py              # 导入冒烟测试
+    ├── test_asr_language_mode.py # 语音识别语言模式测试
     ├── test_audio.py            # 音频子系统测试
+    ├── test_config_loading.py   # 配置加载测试
     ├── test_guidance.py         # 引导滞回逻辑测试
+    ├── test_llm_vision.py       # LLM 视觉解析器测试
     ├── test_logging.py          # 日志与 FPS 测试
-    └── test_llm_vision.py       # LLM 视觉解析器测试
+    ├── test_system_tts_policy.py # 系统 TTS 策略测试
+    └── test_task_metrics.py     # 任务指标测试
 ```
 
 ---
