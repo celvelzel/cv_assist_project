@@ -39,7 +39,7 @@ Finally, Google MediaPipe tracks twenty-one 3D hand landmarks in real-time. By c
 
 We make a key contribution in the Guidance Controller. Rather than processing every module at the same frame rate, we designed a Dynamic Frame Skipping mechanism.
 
-Our hand tracking runs smoothly at a high frequency of 30 Hz. However, the object detection and depth estimation inferences are running in a low frequency of 5 Hz. It dynamically skips expensive visual inference, which ensures the system maintain high smoothness without overloading standard edge devices.
+Our hand tracking runs smoothly at a high frequency of 30 Hz. However, the object detection and depth estimation inferences are running in a low frequency of 5 Hz. It dynamically skips expensive visual inference, which ensures the system maintain high smoothness without overloading standard edge devices. Additionally, we incorporated a short beeps with decreasing intervals as distance decreases, enhancing the user experience.
 
 [Click for Next Slide]
 
