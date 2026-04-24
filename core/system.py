@@ -2098,9 +2098,9 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='CV 视觉辅助系统')
-    parser.add_argument('--config', choices=['fast', 'balanced', 'no-voice', 'light'], 
+    parser.add_argument('--config', choices=['fast', 'balanced', 'voice', 'tts', 'mimo-tts', 'light'], 
                        default='balanced',
-                       help='配置模式: fast=快速, balanced=平衡(默认), no-voice=关闭ASR/TTS, light=极低资源模式')
+                       help='配置模式: fast=快速, balanced=平衡, voice=启用ASR+TTS, tts=仅启用TTS, mimo-tts=MiMo云端TTS')
     parser.add_argument('--camera', type=int, default=None,
                        help='摄像头 ID，未传时使用 config.yaml 中的 camera.id')
     args = parser.parse_args()

@@ -8,12 +8,12 @@
 
 配置加载优先级（从高到低）:
   1. 环境变量（.env 文件）  — 如 MIMO_API_KEY、POE_API_KEY
-  2. config.yaml profile overrides — 预设覆盖（如 fast、no-voice、light）
+  2. config.yaml profile overrides — 预设覆盖（如 fast、tts 等）
   3. dataclass 默认值 — 本文件中定义的默认值
 
 用法:
     from config import load_config
-    config = load_config(profile="balanced")
+    config = load_config(profile="tts")
 """
 
 import os
@@ -994,8 +994,7 @@ def load_config(profile: str = "balanced",
     3. dataclass 默认值（本文件中定义）
 
     参数:
-        profile:     预设名称。当前 config.yaml 内已定义: "fast" / "no-voice" / "light"；
-                     "balanced" 使用 dataclass 默认值（不需要 YAML override）
+        profile:     预设名称，可选值: "balanced"（默认）/ "fast" / "voice" / "tts" / "mimo-tts"
         yaml_path:   YAML 配置文件路径（默认 "config.yaml"）
         dotenv_path: .env 文件路径（默认 ".env"）
 
@@ -1003,7 +1002,7 @@ def load_config(profile: str = "balanced",
         SystemConfig 实例，包含所有合并后的配置值
 
     示例:
-        >>> config = load_config(profile="balanced")
+        >>> config = load_config(profile="tts")
         >>> print(config.audio.enable_tts)  # True
     """
     # 1. 加载环境变量（.env 文件）
