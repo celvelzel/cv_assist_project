@@ -1,276 +1,167 @@
-# 音频功能使用指南 (ASR & TTS)
+# 音频功能使用指南（ASR & TTS）
 
-本系统现已集成语音识别（ASR）和文本转语音（TTS）功能，让视觉障碍用户可以通过语音命令指定目标，并通过语音反馈获得引导指令。
+本文档说明当前代码中的音频子系统实现与使用方式（已与 `config.py`、`core/system.py`、`requirements.txt` 对齐）。
 
-## 功能特点
+---
 
-### 🎤 ASR (自动语音识别)
-- 使用 OpenAI Whisper 模型进行语音识别
-- 支持中文和英文
-- 自动解析用户指令，提取目标物体
-- 支持多种命令格式（如"找到杯子"、"where is the cup"）
+## 1. 功能概览
 
-### 🔊 TTS (文本转语音)
-- 支持两种后端：pyttsx3（离线）和 MiMo 云端（高质量）
-- 默认使用 MiMo 云端 TTS（需 API Key），可切换为 pyttsx3 离线模式
-- 自动播放引导指令（向左、向右、向上等）
-- 可调节语速和音量
+### ASR（语音识别）
 
-### 🎙️ 录音功能
-- 支持固定时长录音
-- 支持自动检测静音停止录音
-- 高质量音频录制 (16kHz, 单声道)
+- 引擎：`faster-whisper`（`audio/asr.py`）
+- 支持语言：`zh` / `en` / `zh,en` / `auto`
+- 支持指令解析：
+  - 中文：如“找杯子”“帮我找手机”
+  - 英文：如“find the cup”
+- 支持 LLM 视觉辅助纠错（可选）：`audio/llm_vision.py`（Poe API）
 
-## 安装依赖
+### TTS（语音播报）
+
+- 后端：
+  - `pyttsx3`（离线）
+  - `mimo`（云端，需 API Key）
+- 支持普通引导播报、生命周期播报、抢占播报
+- 支持队列节流与过期消息丢弃（降低播报堆积）
+
+### 语音交互行为
+
+- 安装 `pynput` 时：**长按 `v`** 进入录音，松开后识别
+- 未安装 `pynput` 时：自动退化为窗口内短按 `v` 兼容路径
+
+---
+
+## 2. 安装依赖
+
+推荐直接安装项目依赖：
 
 ```bash
-# 安装所有音频依赖
-pip install openai-whisper pyttsx3 sounddevice scipy
-
-# 或使用 requirements.txt
 pip install -r requirements.txt
 ```
 
-### Windows 额外要求
-- Windows 自带 SAPI5 语音引擎，无需额外安装
-- 建议安装中文语音包以获得更好的中文语音效果
+音频相关核心依赖（节选）：
 
-### macOS 额外要求
-- macOS 自带语音合成引擎
-- 可在"系统偏好设置 -> 辅助功能 -> 语音内容"中选择中文语音
+- `faster-whisper`
+- `sounddevice`
+- `scipy`
+- `pyttsx3`
+- `pygame`
+- `pynput`
+- `openai`（用于 MiMo / Poe API 客户端）
 
-### Linux 额外要求
+> 注意：当前实现是 `faster-whisper`，不是 `openai-whisper`。
+
+---
+
+## 3. API Key 配置
+
+复制模板：
+
 ```bash
-# 安装 espeak（TTS 引擎）
-sudo apt-get install espeak
+cp .env.example .env
 ```
 
-## 使用方法
+按需设置：
 
-### 1. 测试音频功能
+```env
+MIMO_API_KEY=your_mimo_api_key_here
+POE_API_KEY=your_poe_api_key_here
+```
 
-首先测试音频功能是否正常工作：
+- `MIMO_API_KEY`：启用 MiMo 云端 TTS
+- `POE_API_KEY`：启用 LLM 视觉纠错
+
+---
+
+## 4. 运行方式
+
+```bash
+# 默认平衡模式
+python main.py --config balanced
+
+# 仅视觉（关闭 ASR/TTS）
+python main.py --config no-voice
+
+# 性能优先
+python main.py --config fast
+```
+
+> `config.yaml` 当前定义的 profile 为：`fast`、`no-voice`、`light`。  
+> `balanced` 为默认基础配置（来自 `config.py`）。
+
+---
+
+## 5. 常用音频配置项（`config.py`）
+
+### ASR
+
+- `audio.enable_asr`
+- `audio.whisper_model`（默认 `medium`）
+- `audio.whisper_compute_type`（可选）
+- `audio.asr_language`（默认 `zh,en`）
+
+### TTS
+
+- `audio.enable_tts`
+- `audio.tts_provider`（`pyttsx3` / `mimo`）
+- `audio.tts_rate`
+- `audio.tts_volume`
+- `audio.tts_async`
+- `audio.tts_instruction_interval_sec`
+- `audio.tts_grab_repeat_sec`
+- `audio.tts_max_queue_size`
+- `audio.tts_drop_stale`
+- `audio.tts_state_change_bypass`
+
+### 长按 v 相关
+
+- `audio.voice_v_long_press_sec`
+- `audio.voice_record_after_enter_tts`
+- `audio.voice_after_enter_tts_delay_sec`
+- `audio.voice_min_capture_sec`
+- `audio.voice_min_capture_rms`
+
+### LLM 视觉纠错
+
+- `llm_vision.enable_llm_parsing`
+- `llm_vision.poe_model`
+- `llm_vision.poe_timeout_sec`
+- `llm_vision.max_frames_for_vision`
+- `llm_vision.api_retry_count`
+
+---
+
+## 6. 测试
 
 ```bash
 python tests/test_audio.py
+python tests/test_asr_language_mode.py
+python tests/test_llm_vision.py
+python tests/test_system_tts_policy.py
 ```
 
-这将测试：
-- TTS 文本转语音
-- 录音器功能
-- ASR 语音识别
+说明：
 
-### 2. 启用语音功能运行主程序
+- `test_audio.py` 为脚本型测试，可能依赖真实麦克风/扬声器环境
+- `test_llm_vision.py` 含 API/可选依赖路径，部分场景可能 skip
 
-#### 方式一：使用预设配置
+---
 
-```bash
-# 使用语音配置（同时启用 ASR 和 TTS）
-python main.py --config voice
+## 7. 排障建议
 
-# 仅启用 TTS（ASR 关闭）
-python main.py --config tts
-```
+### 没有声音
 
-#### 方式二：修改配置文件
+1. 检查系统输出设备与音量
+2. 检查 `audio.enable_tts` 与 `audio.tts_provider`
+3. 使用 MiMo 时确认 `MIMO_API_KEY` 有效
 
-编辑 `config.py`，修改 `AudioConfig`:
+### 语音识别无结果
 
-```python
-@dataclass
-class AudioConfig:
-    enable_asr: bool = True        # 启用语音识别
-    enable_tts: bool = True        # 启用文本转语音
-    whisper_model: str = "base"    # Whisper 模型大小
-    asr_language: str = "zh,en"    # 识别语言
-    tts_provider: str = "mimo"     # TTS 提供商
-    tts_rate: int = 180            # 语速
-```
+1. 检查麦克风权限与设备
+2. 检查 `audio.enable_asr`
+3. 调整 `audio.whisper_model` 与 `audio.asr_language`
 
-然后正常运行：
+### 长按 v 不生效
 
-```bash
-python main.py
-```
-
-### 3. 使用语音控制
-
-运行程序后，使用以下键盘控制：
-
-- `v` - 开始语音输入（录制语音命令）
-- `q` - 退出程序
-- `d` - 切换深度显示
-
-#### 语音命令示例
-
-**中文：**
-- "找到杯子"
-- "帮我找一下手机"
-- "寻找瓶子"
-- "定位鼠标"
-
-**英文：**
-- "find the cup"
-- "where is the bottle"
-- "locate the phone"
-
-系统会自动：
-1. 录制你的语音（自动检测静音停止，或固定 5 秒）
-2. 使用 Whisper 识别语音内容
-3. 解析指令，提取目标物体
-4. 更新检测目标
-5. 开始引导你找到目标
-
-### 4. 语音反馈
-
-当启用 TTS 后，系统会自动：
-- 播放引导指令（"向左移动"、"向右移动"等）
-- 播放状态提示（"正在录音"、"正在识别"等）
-- 播放确认信息（"正在寻找杯子"）
-
-## 配置选项
-
-### ASR 配置
-
-- `enable_asr`: 是否启用语音识别（默认 **True**）
-- `whisper_model`: Whisper 模型大小
-  - `tiny`: 最快，准确率较低 (~39M)
-  - `base`: 速度快，准确率一般 (~74M) - **推荐**
-  - `small`: 平衡选择 (~244M)
-  - `medium`: 准确率高 (~769M)
-  - `large`: 最准确 (~1550M)
-- `asr_language`: 识别语言（`zh` 中文, `en` 英文）
-
-### TTS 配置
-
-- `enable_tts`: 是否启用语音输出（默认 **True**）
-- `tts_provider`: TTS 提供商（默认 `"mimo"`）
-  - `"pyttsx3"`: 离线，使用系统语音引擎
-  - `"mimo"`: 云端，需 API Key 但音质更好
-- `tts_rate`: 语速（默认 **180**）
-  - 范围：100-300
-  - 推荐：150-200
-- `tts_volume`: 音量（默认 1.0）
-  - 范围：0.0-1.0
-- `tts_async`: 异步播放（默认 True）
-  - True: 不阻塞主程序
-  - False: 等待播放完成
-
-### 录音配置
-
-- `record_sample_rate`: 采样率（默认 16000 Hz）
-- `record_duration`: 最大录制时长（默认 5.0 秒）
-- `auto_detect_silence`: 自动检测静音停止（默认 True）
-- `silence_threshold`: 静音阈值（默认 0.01）
-- `silence_duration`: 静音持续时长（默认 1.5 秒）
-
-## 性能优化
-
-### 选择合适的 Whisper 模型
-
-| 模型 | 大小 | 速度 | 准确率 | 推荐场景 |
-|------|------|------|--------|----------|
-| tiny | 39M | 很快 | 低 | 测试或低配置设备 |
-| base | 74M | 快 | 中 | **日常使用（推荐）** |
-| small | 244M | 中 | 高 | 需要高准确率 |
-| medium | 769M | 慢 | 很高 | 专业应用 |
-| large | 1550M | 很慢 | 最高 | 研究或离线场景 |
-
-### 设备选择
-
-```python
-# 使用 GPU 加速（如果可用）
-config.optimization.device = "cuda"
-
-# 使用 CPU（兼容性更好）
-config.optimization.device = "cpu"
-```
-
-## 故障排除
-
-### TTS 无声音
-
-1. 检查系统音量
-2. 检查是否安装了 pyttsx3: `pip install pyttsx3`
-3. Windows: 检查语音引擎是否正常
-4. Linux: 确保安装了 espeak: `sudo apt-get install espeak`
-
-### ASR 识别失败
-
-1. 确保麦克风工作正常
-2. 检查录音权限（Windows 需要在设置中允许应用访问麦克风）
-3. 尝试较小的 Whisper 模型（如 `base` 或 `tiny`）
-4. 检查网络连接（首次运行需要下载模型）
-
-### 录音无法启动
-
-1. 检查麦克风是否连接
-2. 确保安装了 sounddevice: `pip install sounddevice`
-3. 运行 `test_audio.py` 查看可用音频设备
-4. 如果有多个麦克风，先运行 `python tests/test_audio.py` 查看设备
-
-### 模型下载慢
-
-Whisper 模型首次运行时会自动下载。如果下载慢：
-
-1. 等待下载完成（仅首次需要）
-2. 使用较小的模型（如 `tiny` 或 `base`）
-3. 配置代理或手动下载模型到缓存目录
-
-模型缓存位置：
-- Windows: `C:\Users\<用户名>\.cache\whisper`
-- macOS/Linux: `~/.cache/whisper`
-
-## 示例代码
-
-### 单独使用 TTS
-
-```python
-from audio.tts.base import TTSEngine
-
-# 初始化 TTS
-tts = TTSEngine(rate=180, volume=1.0)
-
-# 播放文本
-tts.speak("你好，欢迎使用视觉辅助系统")
-
-# 关闭
-tts.close()
-```
-
-### 单独使用 ASR
-
-```python
-from audio.asr import ASREngine
-from audio.audio_utils import AudioRecorder
-
-# 初始化 ASR
-asr = ASREngine(model_name="base", language="zh,en")
-
-# 录制音频
-recorder = AudioRecorder(sample_rate=16000)
-audio = recorder.record(duration=5.0)
-
-# 识别
-result = asr.transcribe_audio(audio)
-print(f"识别结果: {result['text']}")
-
-# 解析指令
-target = asr.parse_command(result['text'])
-print(f"目标: {target}")
-```
-
-## 参考资料
-
-- [OpenAI Whisper](https://github.com/openai/whisper) - 语音识别模型
-- [pyttsx3](https://github.com/nateshmbhat/pyttsx3) - 文本转语音库
-- [sounddevice](https://python-sounddevice.readthedocs.io/) - 录音库
-
-## 未来改进
-
-- [ ] 支持连续语音识别（无需按键）
-- [ ] 支持多轮对话
-- [ ] 添加唤醒词功能
-- [ ] 支持更多语言
-- [ ] 优化语音识别延迟
-- [ ] 添加语音情感检测
+1. 确认已安装 `pynput`
+2. 查看日志是否提示已启用长按监听
+3. 未安装 `pynput` 时可使用短按 `v` 兼容路径
